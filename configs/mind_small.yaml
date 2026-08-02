@@ -1,0 +1,10 @@
+# Configuration for the MIND-small dataset.
+# Paths below are relative to the project root; load_config() resolves them
+# to absolute paths so scripts behave the same regardless of the working
+# directory they're launched from.
+
+dataset_name: mind_small
+raw_dir: data/raw/mind_small
+interim_dir: data/interim/mind_small
+processed_dir: data/processed/mind_small
+random_seed: 42
