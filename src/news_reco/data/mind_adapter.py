@@ -65,9 +65,18 @@ def build_impressions_and_interactions(
     """
     behaviors = pd.concat(behaviors_frames, ignore_index=True)
 
+    # MIND's own impression_id is only unique *within* one split's file --
+    # train and dev each number their impressions starting from 1, so
+    # concatenating them naively creates duplicate IDs across splits (every
+    # dev impression_id collides with a train one). Every join in this
+    # project treats impression_id as a global primary key, so we replace it
+    # here with a fresh, guaranteed-unique id rather than trusting MIND's
+    # file-local numbering to mean what it looks like it means.
+    global_impression_id = pd.RangeIndex(len(behaviors))
+
     impressions = pd.DataFrame(
         {
-            "impression_id": behaviors["impression_id"],
+            "impression_id": global_impression_id,
             "user_id": behaviors["user_id"],
             "time": behaviors["time"],
             "history": behaviors["history"].apply(_parse_history),
@@ -78,7 +87,10 @@ def build_impressions_and_interactions(
     # string ops here, rather than a Python loop, because this runs over
     # tens of thousands of impressions with dozens of candidates each.
     candidate_pairs = behaviors["impressions"].str.split()
-    exploded = behaviors[["impression_id"]].join(candidate_pairs.rename("pair")).explode("pair")
+    exploded = (
+        pd.DataFrame({"impression_id": global_impression_id, "pair": candidate_pairs})
+        .explode("pair")
+    )
     # rsplit from the right, once: article IDs never contain "-", but
     # splitting from the label side is the robust way to write this either way.
     split_pair = exploded["pair"].str.rsplit("-", n=1, expand=True)

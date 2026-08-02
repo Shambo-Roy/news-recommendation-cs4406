@@ -56,6 +56,10 @@ def test_build_articles_table_dedupes_and_fills_missing_abstract():
 
 
 def test_build_impressions_and_interactions_explodes_candidates():
+    # Deliberately reuse impression_id=1 in both frames: MIND's train and
+    # dev files each number impressions starting from 1 independently, so a
+    # correct implementation must not trust these raw IDs to be unique
+    # across frames -- it has to mint its own.
     behaviors_a = pd.DataFrame(
         {
             "impression_id": [1],
@@ -67,7 +71,7 @@ def test_build_impressions_and_interactions_explodes_candidates():
     )
     behaviors_b = pd.DataFrame(
         {
-            "impression_id": [2],
+            "impression_id": [1],  # collides with behaviors_a's impression_id
             "user_id": ["U2"],
             "time": [pd.Timestamp("2019-11-11 09:00:00")],
             "history": [None],  # cold-start: no prior clicks
@@ -78,24 +82,28 @@ def test_build_impressions_and_interactions_explodes_candidates():
     impressions, interactions = build_impressions_and_interactions(behaviors_a, behaviors_b)
 
     assert len(impressions) == 2
-    imp1 = impressions.set_index("impression_id").loc[1]
+    assert impressions["impression_id"].is_unique, "colliding raw MIND impression_ids must not survive"
+
+    imp1_id, imp2_id = impressions["impression_id"]
+    imp1 = impressions.set_index("impression_id").loc[imp1_id]
     assert imp1["history"] == ["N1", "N2"]
-    imp2 = impressions.set_index("impression_id").loc[2]
+    imp2 = impressions.set_index("impression_id").loc[imp2_id]
     assert imp2["history"] == []
 
     assert len(interactions) == 3
+    assert set(interactions["impression_id"]) == {imp1_id, imp2_id}
     imp1_candidates = set(
         zip(
-            interactions.loc[interactions["impression_id"] == 1, "article_id"],
-            interactions.loc[interactions["impression_id"] == 1, "clicked"],
+            interactions.loc[interactions["impression_id"] == imp1_id, "article_id"],
+            interactions.loc[interactions["impression_id"] == imp1_id, "clicked"],
         )
     )
     assert imp1_candidates == {("N3", 0), ("N4", 1)}
 
     imp2_candidates = set(
         zip(
-            interactions.loc[interactions["impression_id"] == 2, "article_id"],
-            interactions.loc[interactions["impression_id"] == 2, "clicked"],
+            interactions.loc[interactions["impression_id"] == imp2_id, "article_id"],
+            interactions.loc[interactions["impression_id"] == imp2_id, "clicked"],
         )
     )
     assert imp2_candidates == {("N5", 0)}

@@ -8,3 +8,11 @@ raw_dir: data/raw/mind_small
 interim_dir: data/interim/mind_small
 processed_dir: data/processed/mind_small
 random_seed: 42
+
+# Temporal split cutoffs (Milestone 3). Official MIND-small train spans
+# 2019-11-09 -> 2019-11-14; official dev is exactly 2019-11-15. We treat dev
+# as test, and carve val out of train's last calendar day, so the boundaries
+# below mirror the dataset's own day structure rather than an arbitrary
+# percentage cut.
+val_start: "2019-11-14 00:00:00"
+test_start: "2019-11-15 00:00:00"
