@@ -6,3 +6,8 @@ pyarrow==17.0.0
 numpy==2.1.3
 PyYAML==6.0.2
 pytest==8.3.3
+
+# Milestone 1: dataset acquisition. MIND-small is hosted on a gated Hugging
+# Face repo, so we use their client library (handles the auth token cache
+# and resumable downloads) instead of a bare HTTP request.
+huggingface_hub==0.25.2
