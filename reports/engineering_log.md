@@ -197,3 +197,158 @@ the design note itself.
   of official `train` by time — plus leakage checks confirming no
   impression's candidates or history reference data from beyond its own
   cutoff.
+
+---
+
+## Milestone 3 — Temporal train/val/test split & leakage checks (2026-08-02)
+
+**What was built**
+- Extended `PipelineConfig`/`load_config()` with `val_start`/`test_start` —
+  generic fields (every dataset needs a temporal split), not MIND-specific.
+- `configs/mind_small.yaml`: `val_start = 2019-11-14 00:00:00`,
+  `test_start = 2019-11-15 00:00:00` (student's choice: val = train's last
+  calendar day, test = official dev).
+- `src/news_reco/splitting/temporal_split.py`:
+  - `assign_split()` — labels each impression train/val/test by timestamp.
+  - `check_split_boundaries()` — asserts every label agrees with its
+    timestamp (catches a bug in assignment/joining before it corrupts eval).
+  - `check_no_future_click_leakage()` — independently verifies every
+    impression's claimed `history` against the actual click log, separating
+    genuinely unverifiable entries (predate our window) from real
+    contradictions (claimed-prior click observed only later).
+- `tests/test_temporal_split.py`: 6 tests, including two *deliberately
+  broken* inputs (mislabeled split, a manufactured future-click) to prove
+  the checks actually catch problems, not just pass trivially.
+- `scripts/split_mind.py`: runs the full split + both checks against real
+  data, writes `data/processed/mind_small/impression_splits.parquet`.
+
+**Design decisions**
+- **Val = train's last calendar day (Nov 14), not a percentage cut**
+  (student's explicit choice) — mirrors the dataset's own day-boundary
+  logic (dev is exactly one day), rather than an arbitrary percentage with
+  no real-world referent.
+- **Leakage check uses a documented tolerance (1%), not zero-tolerance
+  hard failure.** Real run found a genuine, quantified signal — see below —
+  that traces to a structural limitation of the dataset (a truncated
+  observation window), not a pipeline bug. Blocking the entire pipeline on
+  a fully-explained 0.06% rate would be zero-tolerance theater, not rigor;
+  reporting the exact rate and mechanism *is* the rigor the assignment's
+  anti-gaming clause asks for.
+- **Tie timestamps (first_click_time == impression_time) are not
+  violations.** MIND timestamps have 1-second resolution; a tie is
+  consistent with the click having happened at or before that second.
+  Discovered via the real-data run (see Observations), not anticipated
+  up front — a good example of why "run it on real data" is part of the
+  milestone, not optional.
+
+**Observations**
+- Split sizes: **train 126,695 / val 30,270 / test 73,152** impressions.
+- Leakage check, initial run (`>=` comparison): 6,902 / 7,470,153 (0.092%)
+  history entries flagged. Investigating *why* (rather than just fixing the
+  count) found:
+  - 2,738 of those were exact-second ties → not real violations → fixed by
+    switching to strict `>`.
+  - Of the remaining 4,164 genuine violations (0.056% of all history
+    entries), **60% trace to a single article, N47020** — one popular
+    article being re-clicked by many users after their history already
+    referenced it. Only 154 unique articles are involved in any violation.
+  - Mechanism: a user's *true* first click on an article can predate our
+    6-7 day logging window (unobservable to us); if they click the same
+    article again later, our "first observed click" is that later
+    re-click, which can appear to postdate an earlier history reference to
+    the same (unobservable, earlier) original click.
+- 7,453,664 / 7,470,153 (99.8%) of history entries are simply unverifiable
+  (article never observed as a click in our own logs at all) — expected
+  and not a violation; MIND's history is known to extend before the
+  logging window starts.
+
+**Limitations**
+- We cannot fully eliminate the 0.056% residual signal without data outside
+  the dataset (true pre-window click times). It's disclosed, quantified,
+  and small — appropriate to report as-is in the design note rather than
+  engineer away.
+- The 1% tolerance threshold is a judgment call, not derived from a formal
+  procedure; chosen because the observed rate (0.056%) is ~18x below it
+  and the mechanism is fully explained, not because 1% has independent
+  justification.
+
+**Next**
+- Milestone 4: minimal feature store (article store + interaction log,
+  id-addressable, split-aware).
+
+---
+
+## Milestone 4 — Minimal feature store (2026-08-02)
+
+**What was built**
+- `src/news_reco/features/store.py`: `FeatureStore` class — loads
+  `articles`/`impressions`/`interactions`/`impression_splits` once, exposes
+  `get_article_text()`, `get_impressions(split)`, `get_interactions(split)`,
+  and computes `history_length`/`is_cold_start` per impression.
+- `tests/test_feature_store.py`: 4 tests against real cleaned+split data.
+- `scripts/build_feature_store.py`: materializes
+  `data/processed/mind_small/impressions_features.parquet` and prints
+  cold-start/warm counts per split (the rubric's required slice).
+
+**Design decisions**
+- **`is_cold_start` is defined per-impression** (history length at that
+  impression's own time), not per-user from a user's full history. A
+  user-level definition would use information from impressions that hadn't
+  happened yet relative to an earlier one — exactly the kind of leakage
+  Milestone 3 was built to prevent. Not treated as an open choice: given
+  the temporal-integrity work already done, a static per-user definition
+  would contradict it, not just be a stylistically different option.
+- **`FeatureStore` loads everything into memory once**, rather than
+  querying parquet files per call. Reasonable at MIND-small's scale
+  (hundreds of MB); flagged as a real limitation below for the "breaks at
+  10x" design-note question.
+
+**A real bug found by testing, not hypothetical:** `test_split_partition_covers_every_impression_exactly_once`
+failed on first run — val and test impression_ids were not disjoint.
+Root cause: MIND's train and dev `behaviors.tsv` each number impressions
+starting from **1 independently** (they were never meant to share an ID
+space). Milestone 2's `build_impressions_and_interactions` concatenated
+train+dev but kept MIND's raw `impression_id` unchanged, so 73,152 dev-origin
+rows silently collided with train-origin rows sharing the same raw ID.
+
+- **Why it stayed invisible through Milestones 2 and 3:** M2 only checked
+  row *counts* (correct, since concatenation doesn't drop rows). M3's
+  `assign_split` operates positionally on the DataFrame, not by ID value, so
+  every row still got the correct time-based label despite the collision.
+  The corruption only became externally visible in M4, because
+  `FeatureStore` re-joins `impression_splits.parquet` back onto impressions
+  **by `impression_id`** — with a non-unique key, that merge silently fans
+  out into a many-to-many join, cross-contaminating train and dev rows.
+- **Fix:** `mind_adapter.build_impressions_and_interactions` now mints a
+  fresh `pd.RangeIndex`-based `impression_id` after concatenation instead of
+  trusting MIND's file-local numbering.
+- **Regression test added:** `test_mind_adapter.py`'s existing test was
+  rewritten to deliberately reuse `impression_id=1` across both input
+  frames (matching MIND's real structure) — the original version used
+  non-colliding IDs (1 and 2) and could never have caught this. Lesson:
+  synthetic test data has to be adversarial on the specific axis a bug can
+  occur on, not just "different-looking."
+- **Blast radius, quantified:** re-ran `clean_mind.py` and `split_mind.py`
+  after the fix. Row counts and split sizes were unchanged (126,695 /
+  30,270 / 73,152 — both time-based, unaffected by the ID bug), but the
+  leakage-check numbers *did* shift slightly (4,164 → 3,964 genuine
+  violations), because that check also joins interactions to impressions by
+  `impression_id` — so some of Milestone 3's original click-log matches
+  were themselves computed against the corrupted join. The Milestone 3 log
+  entry above is now superseded by these corrected numbers.
+
+**Observations**
+- Cold-start rates by split: train 1.9% (2,466/126,695), val 2.5%
+  (772/30,270), test 3.0% (2,214/73,152) — small but present in every
+  split, enough volume for Milestone 8's required slice metrics.
+
+**Limitations**
+- `FeatureStore` loading everything into memory won't hold at EB-NeRD scale
+  (600M+ impressions) — worth naming explicitly in the design note's "where
+  this breaks at 10x" section, with a sketch of the fix (chunked/lazy
+  loading, or push the joins into a real on-disk store).
+
+**Next**
+- Milestone 5: evaluation harness — explain and implement AUC, MRR,
+  nDCG@5, nDCG@10, plus bootstrap CIs, verified on synthetic data with
+  known-correct answers before touching real retrieval output.

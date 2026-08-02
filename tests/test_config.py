@@ -17,6 +17,7 @@ def test_load_config_reads_all_fields():
     config = load_config(MIND_CONFIG)
     assert config.dataset_name == "mind_small"
     assert config.random_seed == 42
+    assert config.val_start < config.test_start
 
 
 def test_load_config_resolves_paths_to_absolute():

@@ -10,12 +10,24 @@ from __future__ import annotations
 import dataclasses
 from pathlib import Path
 
+import pandas as pd
 import yaml
 
 # Keys every config file must define. Listed explicitly (rather than inferred
 # from the dataclass) so a missing key produces one clear error message here,
 # instead of a confusing AttributeError deep inside some later module.
-REQUIRED_KEYS = ("dataset_name", "raw_dir", "interim_dir", "processed_dir", "random_seed")
+# val_start/test_start are here (not MIND-specific) because every dataset in
+# this project needs a temporal train/val/test split -- it's part of the
+# common spine, not a MIND-only concern.
+REQUIRED_KEYS = (
+    "dataset_name",
+    "raw_dir",
+    "interim_dir",
+    "processed_dir",
+    "random_seed",
+    "val_start",
+    "test_start",
+)
 
 
 @dataclasses.dataclass
@@ -32,6 +44,8 @@ class PipelineConfig:
     interim_dir: Path
     processed_dir: Path
     random_seed: int
+    val_start: pd.Timestamp
+    test_start: pd.Timestamp
 
 
 def load_config(config_path: str | Path) -> PipelineConfig:
@@ -70,4 +84,6 @@ def load_config(config_path: str | Path) -> PipelineConfig:
         interim_dir=(project_root / raw["interim_dir"]).resolve(),
         processed_dir=(project_root / raw["processed_dir"]).resolve(),
         random_seed=int(raw["random_seed"]),
+        val_start=pd.Timestamp(raw["val_start"]),
+        test_start=pd.Timestamp(raw["test_start"]),
     )
