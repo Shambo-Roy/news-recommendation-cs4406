@@ -352,3 +352,85 @@ rows silently collided with train-origin rows sharing the same raw ID.
 - Milestone 5: evaluation harness — explain and implement AUC, MRR,
   nDCG@5, nDCG@10, plus bootstrap CIs, verified on synthetic data with
   known-correct answers before touching real retrieval output.
+
+---
+
+## Milestone 5 — Evaluation harness: AUC, MRR, nDCG@k, bootstrap CIs (2026-08-02)
+
+**What was built**
+- `src/news_reco/evaluation/metrics.py`: `auc_score()` (Mann-Whitney
+  rank-sum identity via `pandas.Series.rank()`, average-rank tie handling,
+  no new dependency), `reciprocal_rank()`, `ndcg_at_k()`. All three return
+  `None` when undefined for an impression rather than a misleading 0.
+- `src/news_reco/evaluation/bootstrap.py`: `bootstrap_ci()` — vectorized
+  resampling (one `(n_resamples, n)` index matrix, not a Python loop).
+- `src/news_reco/evaluation/harness.py`: `evaluate_ranking()` (all 4
+  metrics for one impression) + `aggregate()` (mean, 95% bootstrap CI,
+  n_included/n_excluded per metric across impressions).
+- `tests/test_metrics.py`, `tests/test_bootstrap.py`, `tests/test_harness.py`:
+  19 tests total, all against hand-derived or independently-computed
+  expected values, never against the function under test's own output.
+- `scripts/evaluate_random_baseline.py`: runs the full harness against real
+  val-split interactions with random scores, as an end-to-end sanity check.
+
+**Design decisions**
+- **AUC implemented via the rank-sum identity**, not a pairwise O(n²) loop
+  or a new library dependency (e.g. scikit-learn). `pandas.Series.rank()`
+  handles tied scores (average rank) for free, which matters here since
+  tied scores will be routine once BM25/embedding scores arrive in
+  Milestone 6-7, not a rare edge case.
+- **nDCG's gain term is written as plain `rel`, not `2^rel - 1`.** For
+  binary relevance the two are identical (`2^1-1=1`, `2^0-1=0`), so
+  implementing the graded-relevance formula here would add complexity with
+  zero behavioral difference. Noted explicitly rather than silently
+  "simplified," since it would become a real decision the moment any future
+  extension introduces graded relevance.
+- **Undefined metrics return `None` and are excluded from aggregation**,
+  never coerced to 0. An impression with no click has no meaningful
+  "ranking quality" to score; folding it in as 0 would silently bias every
+  aggregate metric downward in a way that has nothing to do with ranking
+  quality.
+
+**Verification approach**
+- Metric tests use hand-computed exact fractions (AUC, MRR: 1.0, 0.0, 0.5)
+  or, for nDCG (harder to trust by hand), an *independent* formula computed
+  inline in the test via `math.log2` — never copied from the implementation.
+  The nDCG test also asserts `ndcg@5 < ndcg@10` on a case constructed so a
+  relevant item falls between ranks 5 and 10, proving the k-cutoff is
+  actually exercised, not just present in the signature.
+- Bootstrap tests check properties (reproducibility under a fixed seed, a
+  constant array collapsing to a point interval, CI width growing with
+  variance, CI bracketing the sample mean) rather than exact numbers, since
+  a resampling procedure's output isn't hand-computable in the way a closed
+  formula is.
+- **Real-data sanity check**: ran the harness against all 30,270 val
+  impressions (1,222,429 candidate rows) with uniform random scores.
+  Result: **AUC = 0.4994, 95% CI [0.4959, 0.5028]** — tightly
+  bracketing the theoretical 0.5 for random ranking, at real scale. This is
+  independent evidence the implementation is correct beyond the small
+  hand-crafted tests.
+
+**Observations**
+- Every one of MIND-small's 230,117 impressions has at least one click
+  (verified directly: 0 impressions with `clicked` sum = 0) — 72% have
+  exactly one click, the rest a long tail up to 10+. This explains why
+  `n_excluded = 0` for every metric in the random-baseline run: nothing to
+  exclude when every impression has at least one positive.
+- MRR (0.2287) and nDCG@5/@10 (0.2026 / 0.2625) under random scoring are
+  well above 0 as expected (there's always *some* chance of ranking the
+  click near the top by luck, and the metrics reward exactly that by
+  degree), giving a concrete "worse than this is broken" floor for
+  Milestones 6-7's real retrieval methods to beat.
+
+**Limitations**
+- `aggregate()`'s bootstrap reuses one fixed seed across all four metrics
+  in a run; fine for independent per-metric CIs (what C1 needs), but a
+  paired comparison between two systems (C2's ablation requirement) will
+  need the *same* resampled impression indices reused across both systems'
+  metric arrays, not independently reseeded per metric -- a different
+  function to write in Component 2, not a fix needed here.
+
+**Next**
+- Milestone 6: BM25 lexical retrieval — explain BM25, build an index over
+  the article catalog, generate candidates, and get the first real (not
+  random) numbers through this harness.
