@@ -61,6 +61,10 @@ class FeatureStore:
         """Return the indexable text (title + abstract) for one article."""
         return self._articles.loc[article_id, "text"]
 
+    def get_article_title(self, article_id: str) -> str:
+        """Return just the title for one article (used to build BM25 queries from history)."""
+        return self._articles.loc[article_id, "title"]
+
     def get_impressions(self, split: str | None = None) -> pd.DataFrame:
         """Return impressions, with history_length/is_cold_start attached.
 

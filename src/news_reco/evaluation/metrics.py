@@ -80,3 +80,23 @@ def ndcg_at_k(labels: np.ndarray, scores: np.ndarray, k: int) -> float | None:
     idcg = float((1.0 / np.log2(ideal_ranks + 1)).sum())
 
     return dcg / idcg
+
+
+def recall_at_k(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> float | None:
+    """Fraction of relevant (ground-truth clicked) articles retrieved in the top-k.
+
+    This evaluates a *candidate generator* (BM25, embeddings), not a final
+    ranking: out of everything the user actually clicked, how much of it
+    did retrieval even manage to surface in its top-k, before any
+    reranking happens? Method-agnostic by design -- it takes a plain list
+    of retrieved IDs, so the same function evaluates BM25 (Milestone 6) and
+    embedding-based retrieval (Milestone 7) identically.
+
+    Returns None if there are no relevant items to find (nothing to
+    compute recall against).
+    """
+    if len(relevant_ids) == 0:
+        return None
+    retrieved_top_k = set(retrieved_ids[:k])
+    hits = len(retrieved_top_k & relevant_ids)
+    return hits / len(relevant_ids)

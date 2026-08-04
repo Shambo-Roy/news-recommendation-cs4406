@@ -13,7 +13,7 @@ import math
 import numpy as np
 import pytest
 
-from news_reco.evaluation.metrics import auc_score, ndcg_at_k, reciprocal_rank
+from news_reco.evaluation.metrics import auc_score, ndcg_at_k, reciprocal_rank, recall_at_k
 
 # ---------------------------------------------------------------------------
 # AUC
@@ -112,3 +112,25 @@ def test_ndcg_at_k_undefined_with_no_clicks():
     labels = np.array([0, 0, 0])
     scores = np.array([3, 2, 1])
     assert ndcg_at_k(labels, scores, k=10) is None
+
+
+# ---------------------------------------------------------------------------
+# recall@k
+# ---------------------------------------------------------------------------
+
+
+def test_recall_at_k_counts_hits_within_top_k():
+    retrieved = ["a", "b", "c", "d", "e"]
+    relevant = {"c", "z"}  # "c" is in top-5, "z" was never retrieved at all
+    assert recall_at_k(retrieved, relevant, k=5) == pytest.approx(0.5)
+
+
+def test_recall_at_k_ignores_hits_beyond_k():
+    retrieved = ["a", "b", "c"]
+    relevant = {"c"}
+    assert recall_at_k(retrieved, relevant, k=2) == pytest.approx(0.0)
+    assert recall_at_k(retrieved, relevant, k=3) == pytest.approx(1.0)
+
+
+def test_recall_at_k_undefined_with_no_relevant_items():
+    assert recall_at_k(["a", "b"], set(), k=5) is None
