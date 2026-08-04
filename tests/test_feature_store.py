@@ -36,6 +36,11 @@ def test_get_article_text_returns_nonempty_string(store: FeatureStore):
     assert len(text) > 0
 
 
+def test_get_article_title_matches_articles_table(store: FeatureStore):
+    any_article_id = store.articles.iloc[0]["article_id"]
+    assert store.get_article_title(any_article_id) == store.articles.iloc[0]["title"]
+
+
 def test_split_partition_covers_every_impression_exactly_once(store: FeatureStore):
     train = store.get_impressions("train")
     val = store.get_impressions("val")

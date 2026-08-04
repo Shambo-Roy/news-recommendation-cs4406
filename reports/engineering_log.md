@@ -434,3 +434,106 @@ rows silently collided with train-origin rows sharing the same raw ID.
 - Milestone 6: BM25 lexical retrieval — explain BM25, build an index over
   the article catalog, generate candidates, and get the first real (not
   random) numbers through this harness.
+
+---
+
+## Milestone 6 — BM25 lexical retrieval (2026-08-03)
+
+**What was built**
+- `src/news_reco/retrieval/lexical/bm25.py`: hand-built inverted index
+  (`BM25Index`, Okapi BM25, k1=1.5/b=0.75, smoothed IDF), `tokenize()`
+  (lowercase + regex + small stopword list), `build_query_from_history()`
+  (concatenates history titles per the official assignment PDF's Q2.2
+  spec, via an injected `get_title` callable rather than a FeatureStore
+  dependency, so it's testable standalone).
+- `recall_at_k()` added to `news_reco.evaluation.metrics` — deliberately
+  method-agnostic (plain retrieved-ID list in, relevant-ID set in) so
+  Milestone 7's embeddings reuse it unchanged.
+- `FeatureStore.get_article_title()` — symmetry with `get_article_text()`.
+- `tests/test_bm25.py`: 10 tests, all against hand-computed BM25 scores
+  (via an independently-written formula in the test, never the module's
+  own code) or explicit edge cases (empty query, zero term overlap).
+- `scripts/evaluate_bm25_recall.py`: builds the index over the full
+  65,238-article catalog, evaluates recall@{50,100,200} on all val
+  impressions with non-empty history.
+
+**Design decisions**
+- **Hand-built inverted index, not a library** — not just a pedagogical
+  preference: the assignment PDF's Q2.1 explicitly says "build an inverted
+  index," which settles it per "follow the assignment when it's explicit."
+- **Full history used for query construction, not capped to recent-N**
+  (student's explicit choice, against my recommendation to cap at 50 to
+  match MIND's own published baselines and the literal word "recently").
+  Documented cost: some users have up to 558 history articles, producing
+  queries with ~900+ unique terms and materially longer runtimes -- a
+  real, accepted trade-off, not an oversight.
+- **No time-gating of the candidate pool.** As flagged since Milestone 2:
+  MIND's `news.tsv` has no publish-date field, so "only retrieve articles
+  that existed by this impression's time" cannot be enforced for MIND.
+  Retrieval searches the full known catalog; this is a documented
+  limitation, directly relevant to the assignment's anti-gaming clause
+  ("report metrics with and without features unavailable at serving
+  time") -- there is no gating feature to report without, for MIND
+  specifically. Revisit for EB-NeRD, which does have real timestamps.
+
+**A real performance investigation, not just "make it faster"**
+Initial run took ~1 hour for 29,498 val queries. Rather than guessing at a
+fix, profiled first: `fit()` is fast (1.3s over 65K articles); the cost is
+in `search()` -- mean history length is 33 articles (std 41, **max 558**),
+producing queries with hundreds to ~900 unique terms, each requiring a
+full postings-list scan. Sample profiling: ~67ms mean per query, scaling
+with term count (900-term queries: ~150-170ms; 20-term queries: ~50-65ms).
+Also discovered (empirically, not assumed) that MIND's `history` field is
+a **static per-user snapshot** -- it does not grow across a user's later
+impressions within our observed window (verified: three impressions from
+the same user, hours apart, had byte-identical history) -- which produces
+genuine query duplication (33% of val's non-cold-start impressions share
+an exact history with another impression). Applied two behavior-preserving
+optimizations: (1) precomputed IDF cache in `fit()` (previously recomputed
+`math.log()` on every posting-list scan for the same term across every
+query), (2) query-result memoization keyed by query text in the eval
+script (exploits the 33% duplication), plus `itertuples()` instead of
+`iterrows()`. **Verified correctness, not just speed**: re-ran after
+optimizing and confirmed byte-identical recall@K results to the
+unoptimized run -- these were performance fixes, not silent behavior
+changes.
+
+**Results (val split, n=29,498 non-cold-start impressions)**
+
+| K | recall@K | 95% CI |
+|---|---|---|
+| 50 | 0.0119 | [0.0107, 0.0130] |
+| 100 | 0.0241 | [0.0226, 0.0257] |
+| 200 | 0.0393 | [0.0373, 0.0413] |
+
+**Observations**
+- Recall is low in absolute terms (~4% at K=200) but this reflects a
+  genuinely hard setup, not a bug: retrieval competes across the *entire*
+  65,238-article catalog spanning the whole collection window, with no
+  freshness gating, purely on lexical similarity between a user's past
+  reading and a candidate's title+abstract. A real production system would
+  restrict candidates to currently-fresh articles first, which this
+  pipeline cannot do for MIND (see design decisions above) -- this is
+  likely the single largest factor depressing these numbers, and a
+  concrete, measured consequence of a limitation flagged back in
+  Milestone 2, not new information.
+- 772 impressions excluded (empty history / cold-start, no query
+  buildable) -- matches Milestone 4's cold-start count for val **exactly**,
+  a useful cross-check that both pipelines agree.
+- This gives Milestone 7 (semantic retrieval) a concrete number to beat,
+  and Milestone 8 a starting point for the lexical-vs-semantic comparison
+  the assignment's Q3.5 asks for.
+
+**Limitations**
+- Runtime remains significant for the highest-history-length users even
+  after optimization; no fix was applied that would change results (per
+  the student's explicit choice to keep full history), only fixes that
+  preserve them exactly.
+- `evaluate_bm25_recall.py` runs on **val**, not test -- consistent with
+  not touching test until final evaluation (Milestone 8).
+
+**Next**
+- Milestone 7: semantic (embedding-based) retrieval -- explain embeddings
+  and ANN search, compute article embeddings, build an index, retrieve
+  candidates using mean-pooled history embeddings (per Q3.3), and compare
+  against this milestone's BM25 recall@K numbers.
