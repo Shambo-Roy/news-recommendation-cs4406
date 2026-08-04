@@ -14,10 +14,15 @@ data/raw/
 data/interim/
 data/processed/
 
-# Downloaded dataset archives, if fetched into the repo root by mistake
+# Downloaded dataset archives / model artifacts, if placed in the repo by
+# mistake -- explicitly required by the assignment's git commit policy
+# (Q8: no *.zip, *.pt, *.ckpt, __pycache__/, data/ in git).
 *.zip
 *.tsv
 *.parquet
+*.pt
+*.ckpt
+*.vec
 
 # OS/editor noise
 .DS_Store
