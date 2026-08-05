@@ -10,4 +10,11 @@ pytest==8.3.3
 # Milestone 1: dataset acquisition. MIND-small is hosted on a gated Hugging
 # Face repo, so we use their client library (handles the auth token cache
 # and resumable downloads) instead of a bare HTTP request.
-huggingface_hub==0.25.2
+# Pinned version bumped by sentence-transformers' own dependency resolution
+# (Milestone 7) -- 0.25.2 -> 0.36.2; hf_hub_download's API used here is
+# unchanged between these versions.
+huggingface_hub==0.36.2
+
+# Milestone 7: semantic retrieval. Pulls in torch (CPU) as a dependency --
+# sizable download, but needed for real sentence embeddings.
+sentence-transformers==3.2.1

@@ -276,7 +276,7 @@ the design note itself.
 - Milestone 4: minimal feature store (article store + interaction log,
   id-addressable, split-aware).
 
----
+---00000000000000000000000000000000000000000000000000000000000000000000000
 
 ## Milestone 4 — Minimal feature store (2026-08-02)
 
@@ -537,3 +537,129 @@ changes.
   and ANN search, compute article embeddings, build an index, retrieve
   candidates using mean-pooled history embeddings (per Q3.3), and compare
   against this milestone's BM25 recall@K numbers.
+
+---
+
+## Milestone 7 — Semantic (embedding-based) retrieval (2026-08-03)
+
+**What was built**
+- `src/news_reco/retrieval/semantic/embeddings.py`: `compute_embeddings()`
+  (sentence-transformers wrapper, L2-normalized output; imports the
+  library lazily so search-only code paths never need it installed),
+  `EmbeddingIndex` (brute-force cosine similarity via one matrix multiply
+  + `argpartition` top-k, fit() takes precomputed embeddings rather than
+  raw text so the expensive encode step is decoupled from indexing),
+  `build_query_embedding()` (mean-pools history article embeddings per
+  Q3.3, `None` for empty history -- same cold-start handling shape as
+  BM25's `build_query_from_history()`).
+- `FeatureStore` extended with optional embedding loading (skipped
+  gracefully if `article_embeddings.npz` doesn't exist -- every script
+  written before this milestone keeps working unmodified) and
+  `get_article_embedding()`.
+- `scripts/compute_article_embeddings.py`: one-time encode of all 65,238
+  articles' text.
+- `scripts/evaluate_semantic_recall.py`: mirrors
+  `evaluate_bm25_recall.py`'s exact protocol (same val impressions, same
+  non-empty-history filter, same K values) for a fair comparison.
+- `tests/test_embeddings.py`: 6 tests against hand-constructed 2D vectors
+  with obviously-correct cosine similarities (parallel=1.0,
+  orthogonal=0.0, opposite=-1.0), not real model output.
+
+**Design decisions (student's explicit choices)**
+- **all-mpnet-base-v2** (768-dim, ~420MB) over all-MiniLM-L6-v2 (384-dim,
+  ~80MB) -- higher quality, accepted slower/larger cost, against my
+  recommendation of the smaller model as a first pass.
+- **Brute-force numpy over FAISS** -- at 65,238 vectors, an exact matrix
+  multiply is both simpler and faster than standing up an approximate
+  index; the assignment explicitly permits this at small scale.
+
+**A real debugging investigation: torch would not import**
+`sentence_transformers` (and therefore torch) crashed with a Windows "DLL
+initialization routine failed" error -- but *only* when something that
+imports pandas/pyarrow (e.g. `FeatureStore`) got imported into the process
+first; `import torch` completely alone always worked. Investigated rather
+than guessed:
+1. First hypothesis (plausible-sounding, wrong): the classic
+   Intel-OpenMP duplicate-runtime conflict (torch/scipy/scikit-learn each
+   bundle their own copy). Applied the standard fix
+   (`KMP_DUPLICATE_LIB_OK=TRUE`) -- **did not fix it**, including when set
+   before numpy's own import. Left in place as a harmless no-cost safety
+   net, but it wasn't the real cause.
+2. Isolated systematically instead: `numpy + torch` -> fine.
+   `pyarrow + torch` -> crashes. `pandas + torch` -> crashes. This
+   pinpointed pyarrow's bundled native libraries as the actual conflict
+   with torch's, not an OpenMP issue at all.
+3. Tested whether import *order* mattered: `torch` (via
+   `sentence_transformers`) imported **before** pyarrow/pandas -> works,
+   every time, reversed order -> fails, every time (4/4 repeated trials).
+4. **Fix applied where it actually matters**: every entry-point script
+   that needs both (`compute_article_embeddings.py`) now imports
+   `sentence_transformers` as its literal first import, before `numpy`,
+   before `FeatureStore`, before anything else -- documented inline with
+   the reasoning, since this ordering requirement isn't discoverable from
+   any error message and would otherwise silently break the next script
+   that happens to import things in the "natural" order.
+   `evaluate_semantic_recall.py` needs no such fix -- it never imports
+   torch at all, only numpy, precisely because `EmbeddingIndex.fit()` was
+   designed to take precomputed embeddings rather than raw text.
+
+**A second real bug, caught immediately by running the real pipeline**
+`compute_article_embeddings.py` saved `article_ids` via
+`.to_numpy()` without a dtype cast, producing a numpy `object` array
+(pandas' default for string columns). `np.load()` correctly refuses to
+load object arrays without `allow_pickle=True` (a deliberate safety
+default -- arbitrary pickle deserialization is a real risk for untrusted
+files). Fixed at the source (`.astype(str)` forces a fixed-width unicode
+dtype, no pickle needed) and repaired the already-computed embeddings file
+in place (`allow_pickle=True` used just once, on a file this pipeline
+itself generated seconds earlier -- not an untrusted input) rather than
+re-running the ~38-minute encode.
+
+**Results (val split, n=29,498 -- identical protocol to Milestone 6)**
+
+| K | BM25 recall@K | Semantic recall@K |
+|---|---|---|
+| 50 | 0.0119 [0.0107, 0.0130] | **0.0183** [0.0169, 0.0198] |
+| 100 | 0.0241 [0.0226, 0.0257] | **0.0290** [0.0271, 0.0307] |
+| 200 | 0.0393 [0.0373, 0.0413] | **0.0444** [0.0422, 0.0464] |
+
+Semantic retrieval's independent 95% CIs don't overlap BM25's at any K --
+suggestive that mean-pooled mpnet embeddings retrieve better candidates
+than title+abstract BM25 here. **Important caveat, stated precisely
+rather than overclaimed**: these are independent per-method CIs, not a
+paired comparison. The two methods are evaluated on the *same* impressions,
+so their errors are correlated; a proper paired bootstrap (resample
+impression indices once, compute the recall *difference* per resample,
+check whether that CI excludes zero) is the statistically correct way to
+claim significance, not non-overlapping independent intervals. That's
+exactly the paired-bootstrap machinery flagged as missing back in
+Milestone 5's log -- Milestone 8 (full comparison) is where it belongs.
+
+**Observations**
+- Embedding computation: ~2 min per 1,000 articles' worth of throughput
+  once the model was cached locally (first run included a ~420MB one-time
+  model download that inflated an early timing estimate 6x -- worth
+  timing the *encode step alone* on a cached model, not total wall time
+  including download, when estimating).
+- Semantic search itself: full val evaluation (29,498 queries against
+  65,238 x 768-dim vectors) ran in ~2 minutes -- roughly 30x faster than
+  BM25's optimized run, because a single matrix multiply per query beats
+  scanning variable-length postings lists for the very long queries this
+  project's history-cap choice (Milestone 6) produces.
+- 772 excluded impressions again matches Milestone 4's cold-start count
+  exactly -- same cross-check as Milestone 6, now confirmed for a second,
+  independently-built retrieval method.
+
+**Limitations**
+- No paired significance test yet (see above) -- Milestone 8.
+- English-only model choice; EB-NeRD (Danish) will need its own embedding
+  model decision, not a reuse of all-mpnet-base-v2.
+- The torch/pyarrow import-order requirement is undocumented upstream and
+  fragile: any new script combining both dependencies must remember it.
+
+**Next**
+- Milestone 8: full offline evaluation -- BM25 vs. semantic vs. a simple
+  hybrid, AUC/MRR/nDCG@5/nDCG@10 via the Milestone 5 harness (not just
+  recall@K), beyond-accuracy metrics (diversity, novelty, coverage),
+  cold-start/warm slice, and the paired bootstrap comparison this
+  milestone's results are waiting on.
