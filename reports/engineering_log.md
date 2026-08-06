@@ -663,3 +663,187 @@ Milestone 5's log -- Milestone 8 (full comparison) is where it belongs.
   recall@K), beyond-accuracy metrics (diversity, novelty, coverage),
   cold-start/warm slice, and the paired bootstrap comparison this
   milestone's results are waiting on.
+
+---
+
+## Milestone 8 — Full offline evaluation: BM25 vs. semantic vs. hybrid (2026-08-03)
+
+**What was built**
+- `BM25Index.score_documents()` / `EmbeddingIndex.score_documents()`: score
+  a *specific, fixed* candidate set (not open-corpus search) -- needed to
+  compute AUC/MRR/nDCG over an impression's actual shown candidates, where
+  every item has a known label, as opposed to open-corpus retrieval where
+  most retrieved articles were never shown to the user and have no
+  verifiable label at all.
+- `news_reco.retrieval.hybrid`: `reciprocal_rank_fusion()` (combines
+  ranked lists by position, `1/(k+rank)`, k=60 -- the standard RRF
+  default) and `fuse_score_dicts()` (RRF over a fixed candidate set's local
+  ranks, avoiding the need for full-catalog rank lookups).
+- `news_reco.evaluation.beyond_accuracy`: `intra_list_diversity()` (mean
+  pairwise embedding dissimilarity within a list), `NoveltyModel`
+  (self-information from **train-only** click popularity, Laplace-smoothed),
+  `CoverageTracker` (catalog coverage across many recommendation lists).
+- `news_reco.evaluation.slicing.classify_head_tail()`: classifies an
+  impression as head/tail by the *maximum* train-popularity among its
+  clicked articles.
+- `paired_bootstrap_ci()` added to `news_reco.evaluation.bootstrap` --
+  resamples the *same* impression indices for both systems being compared
+  (preserving pairing), giving a CI on the *difference*, not two
+  independent CIs to eyeball for overlap.
+- `scripts/evaluate_full.py`: orchestrates all of the above across BM25,
+  semantic, and RRF hybrid, sliced by head/tail, with the cold-start slice
+  reported separately (see below), plus the paired significance test.
+- 28 new unit tests across `test_bm25.py`, `test_embeddings.py`,
+  `test_beyond_accuracy.py`, `test_hybrid.py`, `test_slicing.py`,
+  `test_bootstrap.py` -- 90 tests total, all passing.
+
+**Design decisions**
+- **AUC/MRR/nDCG computed over the impression's actual shown candidates**
+  (via `score_documents()`), not over our own open-corpus top-K. This
+  refines Milestone 0's original framing ("score our own retrieved top-K
+  against ground truth") once Milestones 6-7's real recall@K numbers
+  (~4% at K=200) made that approach impractical: most of an open-corpus
+  top-K has no verifiable label (it was never shown to the user), so AUC
+  computed that way would be mostly undefined or built on a fabricated
+  "not clicked" assumption for articles that were never actually offered.
+  Rescoring the real candidate set is well-defined for every impression
+  and directly comparable to the official MIND/EB-NeRD leaderboard
+  protocol. recall@K (open-corpus) and AUC/MRR/nDCG (fixed-candidate-set)
+  now answer two different, complementary questions: "can this method find
+  the right item in the whole catalog" vs. "can this method's score rank
+  the right item within what was actually shown."
+- **Hybrid via Reciprocal Rank Fusion**, not weighted score averaging
+  (student's explicit choice) -- avoids needing to justify a normalization
+  scheme for combining BM25's unbounded scores with cosine similarity's
+  bounded range.
+- **Head/tail slice added alongside cold-start/warm** (student's explicit
+  choice) -- cold-start/warm was known in advance to be uninformative
+  for a method-vs-method comparison (see below); head/tail was chosen
+  specifically because it could show a real difference.
+- **Novelty and the head/tail threshold are both computed from TRAIN
+  clicks only**, never from val/test -- using the split being evaluated to
+  define its own difficulty slice would be circular, the same principle
+  already applied to `is_cold_start` (Milestone 4) and BM25's corpus
+  statistics.
+
+**Real, honest finding: cold-start/warm was exactly as degenerate as predicted**
+0% cold-start coverage for all three methods on both val (772/30,270) and
+test -- every method here requires non-empty history to build a query at
+all (`build_query_from_history`/`build_query_embedding` both need at least
+one history article). This was anticipated before implementing (see the
+design-decision discussion before this milestone started) and is reported
+as its own section rather than folded into "warm" results, since it's a
+real, structural limitation worth naming plainly: **this pipeline has no
+way to serve a cold-start user at all**, which a production system would
+need a fallback for (e.g. popularity-based recommendations) -- explicitly
+out of scope for C1, but a genuine gap worth flagging for the design note's
+"where it breaks" discussion.
+
+**Results (val split, n=29,498 evaluated, 772 cold-start excluded)**
+
+| Method | AUC | MRR | nDCG@5 | nDCG@10 | recall@200 | diversity | novelty | coverage |
+|---|---|---|---|---|---|---|---|---|
+| BM25 | 0.5811 | 0.3091 | 0.2798 | 0.3383 | 0.0393 | 0.8436 | 17.68 | 0.3147 |
+| Semantic | 0.6452 | 0.3469 | 0.3223 | 0.3825 | 0.0444 | 0.5399 | 17.46 | 0.3171 |
+| Hybrid | 0.6343 | 0.3397 | 0.3140 | 0.3728 | **0.0491** | 0.6678 | 17.57 | **0.3452** |
+
+recall@50/@100/@200 for BM25 and semantic here are **byte-identical** to
+Milestones 6 and 7's standalone recall@K runs (0.0393 / 0.0444 at K=200) --
+a strong cross-check that this larger, more complex script reproduces
+prior results exactly while extending them, not a coincidence.
+
+**Paired bootstrap: semantic vs. BM25 (AUC, all impressions, val)**
+Mean difference (semantic − BM25) = **0.0641**, 95% CI **[0.0599, 0.0679]**
+-- tight, entirely positive, so semantic is significantly better than
+BM25, not just suggestively so via non-overlapping independent CIs
+(Milestone 7's caveat). This is the rigorous version of that earlier,
+hedged observation.
+
+**Two genuinely interesting slice findings, reported with an honest
+interpretation rather than a proven mechanism**
+- **Hybrid has the best recall@100/@200 and the best catalog coverage of
+  all three methods** (0.0491 / 0.3452 vs. semantic's 0.0444 / 0.3171) --
+  RRF fusion combining two structurally different candidate pools
+  surfaces more distinct relevant articles than either method alone, and
+  touches more of the catalog doing it. Diversity (0.6678) also lands
+  neatly between BM25's (0.8436) and semantic's (0.5399), as expected from
+  averaging two very differently-behaved retrievers.
+- **Tail impressions score higher on AUC/MRR/nDCG than head impressions,
+  for all three methods** (e.g. semantic AUC: tail 0.6485 vs. head 0.6389;
+  nDCG@10: tail 0.4263 vs. head 0.3015) -- **but recall@K shows the
+  opposite pattern** (semantic recall@200: head 0.0608 vs. tail 0.0355).
+  Plausible reading: popular ("head") articles are easier to *find* in the
+  full catalog (recall@K) because they're well-represented and
+  textually/topically typical, but once several similar popular articles
+  are competing for the top rank within a small shown candidate set,
+  distinguishing *the specific* correct one gets harder -- rarer articles
+  are less "confusable" with their candidate-set neighbors once already
+  in the running. Flagged explicitly as an interpretation, not a proven
+  causal claim.
+- Diversity and novelty are both fairly stable across head/tail within
+  each method (e.g. BM25 diversity: head 0.8476 vs. tail 0.8414) -- the
+  head/tail split mainly differentiates accuracy metrics, not
+  beyond-accuracy ones, in this data.
+
+**Limitations**
+- `OPEN_CORPUS_POOL = 500` (top-N each method contributes to hybrid
+  open-corpus fusion) is an approximation, not each method's full-catalog
+  ranking -- chosen to keep runtime bounded; a document ranked below 500
+  in both methods cannot enter the fused top-200 even if it would with a
+  full ranking. Not expected to matter much in practice (RRF's own
+  1/(k+rank) weighting already makes rank-500 contributions negligible),
+  but not verified against the unbounded case.
+- `BEYOND_ACCURACY_K = 10` for diversity/novelty/coverage is a reasonable,
+  common recommendation-slate size, not a value specified by the
+  assignment -- a judgment call, stated as such.
+- Full-catalog time-gating remains absent for MIND (no publish-date field
+  -- flagged since Milestone 2); every number in this milestone inherits
+  that limitation.
+
+**Test-split (held-out, final, one-time) results (n=70,938 evaluated, 2,214 cold-start excluded)**
+
+| Method | AUC | MRR | nDCG@5 | nDCG@10 | recall@200 | diversity | novelty | coverage |
+|---|---|---|---|---|---|---|---|---|
+| BM25 | 0.5639 | 0.3048 | 0.2797 | 0.3426 | 0.0179 | 0.8428 | 17.68 | 0.4400 |
+| Semantic | 0.6518 | 0.3592 | 0.3435 | 0.4028 | 0.0322 | 0.5385 | 17.47 | 0.4305 |
+| Hybrid | 0.6281 | 0.3445 | 0.3242 | 0.3862 | 0.0274 | 0.6667 | 17.58 | 0.4636 |
+
+**AUC/MRR/nDCG hold up on held-out data** -- semantic beats BM25 by
+roughly the same margin as on val, and the paired bootstrap confirms it
+again, tighter this time from the larger sample: mean AUC diff
+(semantic − BM25) = **0.0880**, 95% CI **[0.0855, 0.0907]** (n=70,938).
+
+**recall@K drops sharply from val to test for every method** (BM25
+recall@200: 0.0393 -> 0.0179; semantic: 0.0444 -> 0.0322; hybrid:
+0.0491 -> 0.0274) -- roughly halved. This was investigated, not just
+reported: computed what fraction of each split's *actually-clicked*
+articles were never seen (as a candidate or in anyone's history) anywhere
+in train. Val: 48.5% novel. **Test: 77.4% novel.** Test day (official MIND
+dev, Nov 15 -- one day further from train's Nov 9-13 window than val's
+Nov 14) is dominated by articles that didn't exist yet when train was
+collected. Both val and test's clicked articles *are* present in our
+search index (the catalog unions train+dev news.tsv, Milestone 2), so this
+isn't a coverage gap -- it's that content-based retrieval (BM25/semantic)
+depends on textual/topical similarity between a user's **static** history
+and the target article, and a brand-new article covering an event that
+didn't exist when that history was formed has structurally less of that
+signal to match against. This is exactly the "rapid news decay" effect
+the assignment names as a reason temporal splitting and freshness handling
+are instructive here -- and it shows up as a real, ~2x, well-explained
+effect in this project's own numbers, not an abstract warning.
+
+**Head/tail and diversity/novelty/coverage patterns replicate from val to
+test**, with tighter CIs from the larger sample -- tail still outperforms
+head on AUC/MRR/nDCG, head still outperforms tail on recall@K, hybrid
+still wins on coverage (0.4636 vs. semantic's 0.4305 and BM25's 0.4400)
+and sits between BM25 and semantic on diversity. Consistent replication on
+genuinely held-out data is itself a useful piece of evidence that val's
+patterns weren't artifacts of that particular split.
+
+**Next**
+- Component 1 substantially complete: pipeline, temporal split with
+  leakage checks, feature store, evaluation harness, BM25, semantic
+  retrieval, and full comparative evaluation are all built, tested, and
+  run on real data through the held-out test split. Remaining C1 work:
+  design note (<=4 pages), EB-NeRD port (stretch, per the original
+  MIND-first/EB-NeRD-second plan), Codabench submission generation.

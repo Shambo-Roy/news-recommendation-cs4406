@@ -132,3 +132,38 @@ class BM25Index:
 
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         return ranked[:top_k]
+
+    def score_documents(self, query_text: str, doc_ids: list[str]) -> dict[str, float]:
+        """Score a specific, fixed set of documents against a query.
+
+        Unlike search(), this never discovers new candidates -- it answers
+        "how would BM25 rank exactly these documents", which is what's
+        needed to evaluate AUC/MRR/nDCG over an impression's *actual shown*
+        candidates (a small, fixed set with known labels), as opposed to
+        open-corpus retrieval (search()) where most candidates have no
+        ground-truth label at all. Iterates query terms x requested doc_ids
+        (both typically small) rather than full postings lists, since the
+        candidate set here is usually much smaller than a term's postings.
+        """
+        query_terms = set(tokenize(query_text))
+        scores: dict[str, float] = {}
+
+        for doc_id in doc_ids:
+            doc_length = self._doc_lengths.get(doc_id)
+            if doc_length is None:  # doc_id unknown to this index -- score 0
+                scores[doc_id] = 0.0
+                continue
+
+            total = 0.0
+            for term in query_terms:
+                term_freq = self._inverted_index.get(term, {}).get(doc_id, 0)
+                if term_freq == 0:
+                    continue
+                idf = self._idf(term)
+                if idf <= 0:
+                    continue
+                denom = term_freq + self.k1 * (1 - self.b + self.b * doc_length / self._avg_doc_length)
+                total += idf * (term_freq * (self.k1 + 1)) / denom
+            scores[doc_id] = total
+
+        return scores

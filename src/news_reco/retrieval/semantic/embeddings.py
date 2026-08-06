@@ -78,6 +78,11 @@ class EmbeddingIndex:
         """
         self._doc_ids = list(doc_ids)
         self._embeddings = embeddings
+        # Precomputed once here (not rebuilt per score_documents() call) --
+        # this project calls score_documents() once per impression, tens of
+        # thousands of times, and rebuilding a 65K-entry dict each time
+        # would dominate runtime for no reason.
+        self._doc_id_to_index = {doc_id: i for i, doc_id in enumerate(self._doc_ids)}
 
     def search(self, query_vector: np.ndarray, top_k: int) -> list[tuple[str, float]]:
         """Return up to top_k (doc_id, cosine_similarity) pairs, descending."""
@@ -103,6 +108,33 @@ class EmbeddingIndex:
         top_indices = top_indices[np.argsort(-scores[top_indices])]
 
         return [(self._doc_ids[i], float(scores[i])) for i in top_indices]
+
+    def score_documents(self, query_vector: np.ndarray | None, doc_ids: list[str]) -> dict[str, float]:
+        """Cosine similarity between the query and a specific, fixed set of documents.
+
+        Unlike search(), this never discovers new candidates -- it answers
+        "how would this embedding rank exactly these documents", needed to
+        evaluate AUC/MRR/nDCG over an impression's actual shown candidates
+        rather than open-corpus retrieval. A None query_vector (e.g. an
+        empty history -- see build_query_embedding) scores everything 0.0,
+        matching BM25Index.score_documents()'s handling of an empty query.
+        """
+        if self._embeddings is None:
+            raise RuntimeError("EmbeddingIndex.fit() must be called before score_documents().")
+
+        if query_vector is None:
+            return {doc_id: 0.0 for doc_id in doc_ids}
+
+        query_norm = np.linalg.norm(query_vector)
+        if query_norm == 0:
+            return {doc_id: 0.0 for doc_id in doc_ids}
+        normalized_query = query_vector / query_norm
+
+        scores: dict[str, float] = {}
+        for doc_id in doc_ids:
+            idx = self._doc_id_to_index.get(doc_id)
+            scores[doc_id] = float(self._embeddings[idx] @ normalized_query) if idx is not None else 0.0
+        return scores
 
 
 def build_query_embedding(
