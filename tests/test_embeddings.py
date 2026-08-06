@@ -64,6 +64,24 @@ def test_search_before_fit_raises():
         idx.search(np.array([1.0, 0.0]), top_k=1)
 
 
+def test_score_documents_matches_search_for_a_fixed_candidate_set(index: EmbeddingIndex):
+    query = np.array([1.0, 0.0])
+    scored = index.score_documents(query, ["parallel", "orthogonal", "opposite"])
+    assert scored["parallel"] == pytest.approx(1.0)
+    assert scored["orthogonal"] == pytest.approx(0.0)
+    assert scored["opposite"] == pytest.approx(-1.0)
+
+
+def test_score_documents_handles_unknown_doc_id(index: EmbeddingIndex):
+    scored = index.score_documents(np.array([1.0, 0.0]), ["parallel", "not_a_real_doc"])
+    assert scored["not_a_real_doc"] == pytest.approx(0.0)
+
+
+def test_score_documents_none_query_scores_everything_zero(index: EmbeddingIndex):
+    scored = index.score_documents(None, ["parallel", "orthogonal"])
+    assert scored == {"parallel": 0.0, "orthogonal": 0.0}
+
+
 def test_build_query_embedding_mean_pools_history():
     embeddings = {"a": np.array([1.0, 0.0]), "b": np.array([0.0, 1.0])}
     result = build_query_embedding(["a", "b"], get_embedding=lambda aid: embeddings[aid])

@@ -12,7 +12,7 @@ Run with: pytest tests/test_bootstrap.py -v
 import numpy as np
 import pytest
 
-from news_reco.evaluation.bootstrap import bootstrap_ci
+from news_reco.evaluation.bootstrap import bootstrap_ci, paired_bootstrap_ci
 
 
 def test_bootstrap_ci_is_reproducible_with_same_seed():
@@ -52,3 +52,40 @@ def test_bootstrap_ci_widens_with_more_variance():
 def test_bootstrap_ci_rejects_empty_input():
     with pytest.raises(ValueError):
         bootstrap_ci(np.array([]))
+
+
+# ---------------------------------------------------------------------------
+# paired_bootstrap_ci
+# ---------------------------------------------------------------------------
+
+
+def test_paired_bootstrap_ci_is_reproducible_with_same_seed():
+    a = np.array([0.5, 0.6, 0.4, 0.7, 0.3])
+    b = np.array([0.4, 0.5, 0.3, 0.6, 0.2])
+    assert paired_bootstrap_ci(a, b, seed=42) == paired_bootstrap_ci(a, b, seed=42)
+
+
+def test_paired_bootstrap_ci_identical_arrays_contains_zero():
+    values = np.array([0.5, 0.6, 0.4, 0.7, 0.3, 0.5, 0.6])
+    lower, upper = paired_bootstrap_ci(values, values)
+    assert lower <= 0.0 <= upper
+
+
+def test_paired_bootstrap_ci_excludes_zero_for_a_consistent_difference():
+    rng = np.random.default_rng(0)
+    a = rng.uniform(0.4, 0.6, size=500)
+    b = a - 0.1  # b is *always* exactly 0.1 lower than a, every impression
+    lower, upper = paired_bootstrap_ci(a, b, seed=1)
+    assert lower > 0.0  # the whole interval sits above zero -> significant
+    assert lower == pytest.approx(0.1, abs=0.02)
+    assert upper == pytest.approx(0.1, abs=0.02)
+
+
+def test_paired_bootstrap_ci_rejects_mismatched_lengths():
+    with pytest.raises(ValueError):
+        paired_bootstrap_ci(np.array([1.0, 2.0]), np.array([1.0]))
+
+
+def test_paired_bootstrap_ci_rejects_empty_input():
+    with pytest.raises(ValueError):
+        paired_bootstrap_ci(np.array([]), np.array([]))

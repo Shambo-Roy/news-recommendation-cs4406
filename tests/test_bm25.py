@@ -83,6 +83,23 @@ def test_multi_term_query_sums_per_term_scores(index: BM25Index):
     assert results["doc3"] == pytest.approx(expected_doc3)
 
 
+def test_score_documents_matches_search_for_a_fixed_candidate_set(index: BM25Index):
+    # score_documents() and search() compute the same formula -- for a
+    # candidate set search() would return, the scores must agree exactly.
+    search_results = dict(index.search("apple", top_k=10))
+    scored = index.score_documents("apple", ["doc1", "doc2", "doc3"])
+
+    assert scored["doc1"] == pytest.approx(search_results["doc1"])
+    assert scored["doc3"] == pytest.approx(search_results["doc3"])
+    assert scored["doc2"] == pytest.approx(0.0)  # doc2 has zero occurrences of "apple"
+
+
+def test_score_documents_handles_unknown_doc_id(index: BM25Index):
+    scored = index.score_documents("apple", ["doc1", "not_a_real_doc"])
+    assert scored["not_a_real_doc"] == pytest.approx(0.0)
+    assert scored["doc1"] > 0.0
+
+
 def test_search_respects_top_k():
     idx = BM25Index()
     idx.fit(DOC_IDS, TEXTS)
