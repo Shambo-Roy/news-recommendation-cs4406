@@ -1,0 +1,21 @@
+# Configuration for the EB-NeRD demo bundle.
+# Paths below are relative to the project root; load_config() resolves them
+# to absolute paths so scripts behave the same regardless of the working
+# directory they're launched from.
+
+dataset_name: ebnerd_demo
+raw_dir: data/raw/ebnerd_demo
+interim_dir: data/interim/ebnerd_demo
+processed_dir: data/processed/ebnerd_demo
+random_seed: 42
+
+# Verified from the raw files: official train spans 2023-05-18 07:00 ->
+# 2023-05-25 07:00 (7 days); official validation spans 2023-05-25 07:00 ->
+# 2023-06-01 07:00 (the next 7 days, contiguous, non-overlapping). EB-NeRD
+# ships no test split (its real held-out test is the Codabench
+# competition's, unlabeled) -- same shape as MIND, so the same strategy
+# applies: treat official validation as our test (it's already a genuine
+# holdout), and carve our val from the last calendar day of official train
+# (mirroring MIND's val = train's last day).
+val_start: "2023-05-24 07:00:00"
+test_start: "2023-05-25 07:00:00"

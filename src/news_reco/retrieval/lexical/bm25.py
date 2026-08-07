@@ -25,13 +25,39 @@ STOPWORDS = frozenset(
     """.split()
 )
 
-_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+# The same idea for Danish (EB-NeRD), a standard list matching common
+# Danish NLP resources (e.g. the Snowball stemmer's Danish stopword list) --
+# not exhaustive, just the common function words most likely to dominate
+# postings lists the way "the"/"a" do in English. Written with real Danish
+# characters (æ/ø/å), not romanized approximations -- those wouldn't match
+# anything real Danish text tokenizes to.
+DANISH_STOPWORDS = frozenset(
+    """
+    og i jeg det at en den til er som på de med han af for ikke der var
+    mig sig men et har om vi min havde ham hun nu over da fra du ud sin
+    dem os op man hans hvor eller hvad skal selv her alle vil blev kunne
+    ind når være dog noget ville jo deres efter ned skulle denne thi
+    jer sådan
+    """.split()
+)
+
+# [a-z0-9] alone is ASCII-only and would silently mangle Danish text: "på"
+# (very common -- "on"/"at") would tokenize to just "p", since "å" isn't in
+# the character class and breaks the match rather than being included or
+# transliterated. Explicitly including æøå (post lower()) fixes this for
+# Danish while staying a strict superset of the English-only pattern.
+_TOKEN_PATTERN = re.compile(r"[a-zæøå0-9]+")
 
 
-def tokenize(text: str) -> list[str]:
-    """Lowercase, extract alphanumeric tokens, drop stopwords."""
+def tokenize(text: str, stopwords: frozenset[str] = STOPWORDS) -> list[str]:
+    """Lowercase, extract alphanumeric tokens, drop stopwords.
+
+    `stopwords` defaults to English but is a plain parameter, not a
+    hardcoded assumption -- BM25Index passes through whichever set matches
+    the corpus's language (see DANISH_STOPWORDS for EB-NeRD).
+    """
     tokens = _TOKEN_PATTERN.findall(text.lower())
-    return [t for t in tokens if t not in STOPWORDS]
+    return [t for t in tokens if t not in stopwords]
 
 
 def build_query_from_history(history: list[str], get_title: Callable[[str], str]) -> str:
@@ -57,9 +83,10 @@ class BM25Index:
     starting point from the literature.
     """
 
-    def __init__(self, k1: float = 1.5, b: float = 0.75) -> None:
+    def __init__(self, k1: float = 1.5, b: float = 0.75, stopwords: frozenset[str] = STOPWORDS) -> None:
         self.k1 = k1
         self.b = b
+        self._stopwords = stopwords
         self._doc_lengths: dict[str, int] = {}
         self._avg_doc_length: float = 0.0
         self._inverted_index: dict[str, dict[str, int]] = {}  # term -> {doc_id: term_freq}
@@ -72,7 +99,7 @@ class BM25Index:
         total_length = 0
 
         for doc_id, text in zip(doc_ids, texts):
-            terms = tokenize(text)
+            terms = tokenize(text, self._stopwords)
             self._doc_lengths[doc_id] = len(terms)
             total_length += len(terms)
 
@@ -109,14 +136,26 @@ class BM25Index:
         """Look up a term's precomputed IDF; 0.0 for a term never seen during fit()."""
         return self._idf_cache.get(term, 0.0)
 
-    def search(self, query_text: str, top_k: int) -> list[tuple[str, float]]:
+    def search(
+        self, query_text: str, top_k: int, eligible_doc_ids: set[str] | None = None
+    ) -> list[tuple[str, float]]:
         """Return up to top_k (doc_id, score) pairs, ranked by descending BM25 score.
 
         Only documents sharing at least one term with the query are ever
         scored -- that's the point of the inverted index -- so a query with
         no recognized terms (e.g. an empty string) correctly returns [].
+
+        Args:
+            eligible_doc_ids: If given, only these documents can ever be
+                returned -- used for freshness gating (see
+                news_reco.retrieval.availability.AvailabilityGate): a
+                document that hadn't been published yet at the query's
+                time is excluded here, not filtered out after the fact,
+                so it never displaces a genuinely-eligible document from
+                the top_k. None (the default) means no gating, matching
+                every previous caller's behavior unchanged.
         """
-        query_terms = set(tokenize(query_text))
+        query_terms = set(tokenize(query_text, self._stopwords))
         scores: dict[str, float] = {}
 
         for term in query_terms:
@@ -125,6 +164,8 @@ class BM25Index:
                 continue
             postings = self._inverted_index.get(term, {})
             for doc_id, term_freq in postings.items():
+                if eligible_doc_ids is not None and doc_id not in eligible_doc_ids:
+                    continue
                 doc_length = self._doc_lengths[doc_id]
                 denom = term_freq + self.k1 * (1 - self.b + self.b * doc_length / self._avg_doc_length)
                 term_score = idf * (term_freq * (self.k1 + 1)) / denom
@@ -145,7 +186,7 @@ class BM25Index:
         (both typically small) rather than full postings lists, since the
         candidate set here is usually much smaller than a term's postings.
         """
-        query_terms = set(tokenize(query_text))
+        query_terms = set(tokenize(query_text, self._stopwords))
         scores: dict[str, float] = {}
 
         for doc_id in doc_ids:

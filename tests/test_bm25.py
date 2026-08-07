@@ -11,7 +11,7 @@ import math
 
 import pytest
 
-from news_reco.retrieval.lexical.bm25 import BM25Index, build_query_from_history, tokenize
+from news_reco.retrieval.lexical.bm25 import DANISH_STOPWORDS, STOPWORDS, BM25Index, build_query_from_history, tokenize
 
 # ---------------------------------------------------------------------------
 # Tokenizer
@@ -24,6 +24,39 @@ def test_tokenize_lowercases_and_strips_punctuation():
 
 def test_tokenize_drops_stopwords():
     assert tokenize("the cat and the dog") == ["cat", "dog"]
+
+
+def test_tokenize_preserves_danish_special_characters():
+    # [a-z0-9] alone would silently drop "å", turning "på" into just "p" --
+    # this is the exact bug that was caught and fixed before ever running
+    # EB-NeRD data through BM25. Uses no stopwords here deliberately, to
+    # isolate character-class handling from stopword filtering -- Danish
+    # "i" ("in") would otherwise coincidentally vanish via the *English*
+    # stopword list's pronoun "I".
+    assert tokenize("Jeg gik på biblioteket i går", stopwords=frozenset()) == [
+        "jeg", "gik", "på", "biblioteket", "i", "går",
+    ]
+
+
+def test_tokenize_with_danish_stopwords_drops_danish_function_words():
+    # "på" ("on"/"at") and "og" ("and") are common Danish stopwords -- must
+    # be dropped when the Danish list is passed, but would NOT be dropped
+    # by the English list (proving the parameter actually does something).
+    result = tokenize("kongen og dronningen på slottet", stopwords=DANISH_STOPWORDS)
+    assert result == ["kongen", "dronningen", "slottet"]
+    assert tokenize("kongen og dronningen på slottet", stopwords=STOPWORDS) == [
+        "kongen", "og", "dronningen", "på", "slottet",
+    ]
+
+
+def test_bm25index_uses_the_stopwords_it_was_constructed_with():
+    # "og" ("and") should vanish from the index entirely when built with
+    # Danish stopwords -- proving BM25Index actually plumbs the parameter
+    # through to fit(), not just accepting and ignoring it.
+    danish_index = BM25Index(stopwords=DANISH_STOPWORDS)
+    danish_index.fit(["d1"], ["kongen og dronningen"])
+    results = danish_index.search("og", top_k=10)
+    assert results == []  # "og" was dropped as a stopword, never indexed
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +125,21 @@ def test_score_documents_matches_search_for_a_fixed_candidate_set(index: BM25Ind
     assert scored["doc1"] == pytest.approx(search_results["doc1"])
     assert scored["doc3"] == pytest.approx(search_results["doc3"])
     assert scored["doc2"] == pytest.approx(0.0)  # doc2 has zero occurrences of "apple"
+
+
+def test_search_eligible_doc_ids_excludes_ineligible_documents(index: BM25Index):
+    # Without gating, "apple" ranks doc1 above doc3 (both match). Gating
+    # out doc1 (e.g. "not published yet") must never let it leak back in,
+    # no matter how well it would otherwise score.
+    ranked_ids = [doc_id for doc_id, _ in index.search("apple", top_k=10, eligible_doc_ids={"doc3", "doc2"})]
+    assert "doc1" not in ranked_ids
+    assert ranked_ids == ["doc3"]  # doc2 still doesn't match "apple" at all
+
+
+def test_search_eligible_doc_ids_can_exclude_everything():
+    idx = BM25Index()
+    idx.fit(DOC_IDS, TEXTS)
+    assert idx.search("apple", top_k=10, eligible_doc_ids=set()) == []
 
 
 def test_score_documents_handles_unknown_doc_id(index: BM25Index):

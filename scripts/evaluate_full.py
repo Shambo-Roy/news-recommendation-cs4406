@@ -21,9 +21,19 @@ Ends with a paired bootstrap comparison of BM25 vs. semantic on AUC --
 the statistically rigorous version of the recall@K CIs from Milestones 6-7,
 which only supported an *independent*-CI, non-overlap argument.
 
+--gate-freshness restricts open-corpus retrieval to articles published at
+or before each impression's own time (see
+news_reco.retrieval.availability.AvailabilityGate) -- the anti-gaming
+"report metrics with and without features unavailable at serving time"
+requirement, made concrete. Only meaningful for datasets with real
+published_time data (EB-NeRD); MIND has none, and AvailabilityGate refuses
+to construct itself from an all-NaT column rather than silently gating
+nothing.
+
 Usage:
     python scripts/evaluate_full.py --config configs/mind_small.yaml --split val
     python scripts/evaluate_full.py --config configs/mind_small.yaml --split val --limit 200  # quick smoke test
+    python scripts/evaluate_full.py --config configs/ebnerd_demo.yaml --split val --language da --gate-freshness
 """
 
 from __future__ import annotations
@@ -54,8 +64,9 @@ from news_reco.evaluation.harness import aggregate, evaluate_ranking  # noqa: E4
 from news_reco.evaluation.metrics import recall_at_k  # noqa: E402
 from news_reco.evaluation.slicing import classify_head_tail  # noqa: E402
 from news_reco.features.store import FeatureStore  # noqa: E402
+from news_reco.retrieval.availability import AvailabilityGate  # noqa: E402
 from news_reco.retrieval.hybrid import fuse_score_dicts, reciprocal_rank_fusion  # noqa: E402
-from news_reco.retrieval.lexical.bm25 import BM25Index, build_query_from_history  # noqa: E402
+from news_reco.retrieval.lexical.bm25 import DANISH_STOPWORDS, STOPWORDS, BM25Index, build_query_from_history  # noqa: E402
 from news_reco.retrieval.semantic.embeddings import EmbeddingIndex, build_query_embedding  # noqa: E402
 from news_reco.utils.config import PipelineConfig, load_config  # noqa: E402
 
@@ -63,6 +74,7 @@ K_VALUES = (50, 100, 200)
 OPEN_CORPUS_POOL = 500  # top-N each method contributes to hybrid open-corpus RRF fusion
 BEYOND_ACCURACY_K = 10  # recommendation-list size for diversity/novelty/coverage
 METHODS = ("bm25", "semantic", "hybrid")
+STOPWORDS_BY_LANGUAGE = {"en": STOPWORDS, "da": DANISH_STOPWORDS}
 
 
 def main() -> None:
@@ -70,6 +82,12 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="Path to a dataset YAML config.")
     parser.add_argument("--split", default="val", choices=["val", "test"], help="Which split to evaluate.")
     parser.add_argument("--limit", type=int, default=None, help="Evaluate only the first N impressions (smoke test).")
+    parser.add_argument("--language", choices=["en", "da"], default="en", help="BM25 stopword list to use.")
+    parser.add_argument(
+        "--gate-freshness",
+        action="store_true",
+        help="Restrict open-corpus retrieval to articles published at or before each impression's time.",
+    )
     args = parser.parse_args()
     config: PipelineConfig = load_config(args.config)
 
@@ -78,8 +96,12 @@ def main() -> None:
     article_ids = articles["article_id"].tolist()
     n_articles = len(article_ids)
 
+    availability_gate = AvailabilityGate(articles) if args.gate_freshness else None
+    if args.gate_freshness:
+        print("Freshness gating ENABLED -- open-corpus retrieval restricted to articles published by each impression's time.")
+
     print("Building BM25 index ...")
-    bm25 = BM25Index()
+    bm25 = BM25Index(stopwords=STOPWORDS_BY_LANGUAGE[args.language])
     bm25.fit(article_ids, articles["text"].tolist())
 
     print("Building embedding index ...")
@@ -142,16 +164,33 @@ def main() -> None:
         slices_for_this_impression = ["all", classify_head_tail(clicked_ids, train_click_counts, head_tail_threshold)]
 
         bm25_query = build_query_from_history(history, store.get_article_title)
-        if bm25_query not in bm25_query_cache:
-            bm25_query_cache[bm25_query] = bm25.search(bm25_query, top_k=OPEN_CORPUS_POOL)
-        bm25_open_ids = [doc_id for doc_id, _ in bm25_query_cache[bm25_query]]
-        bm25_candidate_scores = bm25.score_documents(bm25_query, candidate_ids)
-
         semantic_query_vector = build_query_embedding(history, store.get_article_embedding)
-        semantic_query_key = tuple(sorted(history))  # mean-pooling is order-invariant -> valid cache key
-        if semantic_query_key not in semantic_query_cache:
-            semantic_query_cache[semantic_query_key] = semantic.search(semantic_query_vector, top_k=OPEN_CORPUS_POOL)
-        semantic_open_ids = [doc_id for doc_id, _ in semantic_query_cache[semantic_query_key]]
+
+        if availability_gate is not None:
+            # Eligible articles depend on *when* this impression happened,
+            # not just its query text -- two impressions with identical
+            # history but different times can have different eligible
+            # sets, so the query-text cache (safe when ungated) would
+            # silently reuse a stale result here. EB-NeRD's scale (~11.8K
+            # articles, thousands of impressions) makes skipping the cache
+            # entirely fast enough that it isn't worth a time-aware key.
+            eligible_doc_ids = availability_gate.eligible_at(impression.time)
+            bm25_open_ids = [doc_id for doc_id, _ in bm25.search(bm25_query, top_k=OPEN_CORPUS_POOL, eligible_doc_ids=eligible_doc_ids)]
+            semantic_open_ids = [
+                doc_id
+                for doc_id, _ in semantic.search(semantic_query_vector, top_k=OPEN_CORPUS_POOL, eligible_doc_ids=eligible_doc_ids)
+            ]
+        else:
+            if bm25_query not in bm25_query_cache:
+                bm25_query_cache[bm25_query] = bm25.search(bm25_query, top_k=OPEN_CORPUS_POOL)
+            bm25_open_ids = [doc_id for doc_id, _ in bm25_query_cache[bm25_query]]
+
+            semantic_query_key = tuple(sorted(history))  # mean-pooling is order-invariant -> valid cache key
+            if semantic_query_key not in semantic_query_cache:
+                semantic_query_cache[semantic_query_key] = semantic.search(semantic_query_vector, top_k=OPEN_CORPUS_POOL)
+            semantic_open_ids = [doc_id for doc_id, _ in semantic_query_cache[semantic_query_key]]
+
+        bm25_candidate_scores = bm25.score_documents(bm25_query, candidate_ids)
         semantic_candidate_scores = semantic.score_documents(semantic_query_vector, candidate_ids)
 
         hybrid_open_ids = [doc_id for doc_id, _ in reciprocal_rank_fusion([bm25_open_ids, semantic_open_ids])]

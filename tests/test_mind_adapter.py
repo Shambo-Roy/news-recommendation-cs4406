@@ -54,6 +54,11 @@ def test_build_articles_table_dedupes_and_fills_missing_abstract():
     n1 = articles.set_index("article_id").loc["N1"]
     assert n1["text"] == "Title One Abstract one."
 
+    # MIND has no publish-date field at all -- every article's
+    # published_time must be NaT ("unknown"), not silently missing from
+    # the schema or defaulted to some real-looking date.
+    assert articles["published_time"].isna().all()
+
 
 def test_build_impressions_and_interactions_explodes_candidates():
     # Deliberately reuse impression_id=1 in both frames: MIND's train and

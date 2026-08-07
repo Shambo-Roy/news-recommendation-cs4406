@@ -9,6 +9,8 @@ instead of re-running the encoder.
 
 Usage:
     python scripts/compute_article_embeddings.py --config configs/mind_small.yaml
+    python scripts/compute_article_embeddings.py --config configs/ebnerd_demo.yaml \
+        --model sentence-transformers/paraphrase-multilingual-mpnet-base-v2
 """
 
 from __future__ import annotations
@@ -33,20 +35,25 @@ from news_reco.features.store import FeatureStore  # noqa: E402
 from news_reco.retrieval.semantic.embeddings import compute_embeddings
 from news_reco.utils.config import PipelineConfig, load_config
 
-MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
+DEFAULT_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="Path to a dataset YAML config.")
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL_NAME,
+        help="Sentence-transformers model name. Use a multilingual model for non-English text (e.g. EB-NeRD's Danish).",
+    )
     args = parser.parse_args()
     config: PipelineConfig = load_config(args.config)
 
     store = FeatureStore(config)
     articles = store.articles
 
-    print(f"Encoding {len(articles):,} articles with {MODEL_NAME} (CPU) ...")
-    embeddings = compute_embeddings(articles["text"].tolist(), model_name=MODEL_NAME)
+    print(f"Encoding {len(articles):,} articles with {args.model} (CPU) ...")
+    embeddings = compute_embeddings(articles["text"].tolist(), model_name=args.model)
     print(f"Done. Embedding matrix shape: {embeddings.shape}")
 
     out_path = config.interim_dir / "article_embeddings.npz"
