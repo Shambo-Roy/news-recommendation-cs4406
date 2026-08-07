@@ -36,6 +36,12 @@ def build_articles_table(*news_frames: pd.DataFrame) -> pd.DataFrame:
             # over one optional field would silently shrink recall for
             # every retrieval method built on top of this table.
             "abstract": combined["abstract"].fillna(""),
+            # MIND's news.tsv has no publish-date field at all (confirmed
+            # Milestone 2) -- NaT here means "unknown", not "never
+            # published", and is what lets a shared freshness-gating
+            # function correctly refuse to gate MIND rather than silently
+            # treating every article as always available.
+            "published_time": pd.NaT,
         }
     )
     # `text` is the single field BM25 and embeddings will actually index --

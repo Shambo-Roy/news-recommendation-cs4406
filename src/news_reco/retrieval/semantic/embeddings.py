@@ -84,8 +84,18 @@ class EmbeddingIndex:
         # would dominate runtime for no reason.
         self._doc_id_to_index = {doc_id: i for i, doc_id in enumerate(self._doc_ids)}
 
-    def search(self, query_vector: np.ndarray, top_k: int) -> list[tuple[str, float]]:
-        """Return up to top_k (doc_id, cosine_similarity) pairs, descending."""
+    def search(
+        self, query_vector: np.ndarray, top_k: int, eligible_doc_ids: set[str] | None = None
+    ) -> list[tuple[str, float]]:
+        """Return up to top_k (doc_id, cosine_similarity) pairs, descending.
+
+        Args:
+            eligible_doc_ids: If given, only these documents can ever be
+                returned -- used for freshness gating (see
+                news_reco.retrieval.availability.AvailabilityGate). None
+                (the default) means no gating, matching every previous
+                caller's behavior unchanged.
+        """
         if self._embeddings is None:
             raise RuntimeError("EmbeddingIndex.fit() must be called before search().")
         if top_k <= 0 or len(self._doc_ids) == 0:
@@ -101,7 +111,25 @@ class EmbeddingIndex:
         # cosine similarity, not just proportional to it.
         scores = self._embeddings @ normalized_query
 
-        k = min(top_k, len(scores))
+        if eligible_doc_ids is None:
+            k = min(top_k, len(scores))
+        else:
+            # Mask ineligible rows to -inf *before* selecting the top-k, so
+            # an ineligible (not-yet-published) document can never displace
+            # an eligible one -- and cap k to how many eligible documents
+            # actually exist, so a small eligible set doesn't pad the
+            # result with -inf-scored (ineligible) entries.
+            mask = np.zeros(len(scores), dtype=bool)
+            for doc_id in eligible_doc_ids:
+                idx = self._doc_id_to_index.get(doc_id)
+                if idx is not None:
+                    mask[idx] = True
+            scores = np.where(mask, scores, -np.inf)
+            k = min(top_k, int(mask.sum()))
+
+        if k == 0:
+            return []
+
         # argpartition finds the top-k in O(n) without fully sorting
         # everything; only that small slice then gets sorted.
         top_indices = np.argpartition(-scores, k - 1)[:k]

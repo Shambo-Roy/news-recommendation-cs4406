@@ -64,6 +64,31 @@ def test_search_before_fit_raises():
         idx.search(np.array([1.0, 0.0]), top_k=1)
 
 
+def test_search_eligible_doc_ids_excludes_ineligible_documents(index: EmbeddingIndex):
+    # Without gating, "parallel" (cosine=1.0) always wins. Gating it out
+    # (e.g. "not published yet") must never let it leak back into the
+    # results no matter how well it would otherwise score.
+    query = np.array([1.0, 0.0])
+    results = index.search(query, top_k=3, eligible_doc_ids={"orthogonal", "opposite"})
+    ranked_ids = [doc_id for doc_id, _ in results]
+    assert "parallel" not in ranked_ids
+    assert ranked_ids == ["orthogonal", "opposite"]  # 0.0 > -1.0
+
+
+def test_search_eligible_doc_ids_caps_results_to_eligible_count(index: EmbeddingIndex):
+    # top_k=3 requested, but only 1 document is eligible -- must not pad
+    # the result with ineligible (-inf-scored) entries.
+    query = np.array([1.0, 0.0])
+    results = index.search(query, top_k=3, eligible_doc_ids={"orthogonal"})
+    assert len(results) == 1
+    assert results[0][0] == "orthogonal"
+
+
+def test_search_eligible_doc_ids_can_exclude_everything(index: EmbeddingIndex):
+    query = np.array([1.0, 0.0])
+    assert index.search(query, top_k=3, eligible_doc_ids=set()) == []
+
+
 def test_score_documents_matches_search_for_a_fixed_candidate_set(index: EmbeddingIndex):
     query = np.array([1.0, 0.0])
     scored = index.score_documents(query, ["parallel", "orthogonal", "opposite"])

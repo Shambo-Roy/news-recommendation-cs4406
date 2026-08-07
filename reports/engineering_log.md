@@ -841,9 +841,279 @@ genuinely held-out data is itself a useful piece of evidence that val's
 patterns weren't artifacts of that particular split.
 
 **Next**
-- Component 1 substantially complete: pipeline, temporal split with
-  leakage checks, feature store, evaluation harness, BM25, semantic
+- Component 1 substantially complete on MIND: pipeline, temporal split
+  with leakage checks, feature store, evaluation harness, BM25, semantic
   retrieval, and full comparative evaluation are all built, tested, and
-  run on real data through the held-out test split. Remaining C1 work:
-  design note (<=4 pages), EB-NeRD port (stretch, per the original
-  MIND-first/EB-NeRD-second plan), Codabench submission generation.
+  run on real data through the held-out test split. **Correction**: the
+  student flagged that the previous entry mischaracterized EB-NeRD as
+  "stretch" -- the assignment PDF is explicit that both datasets are
+  required (Q1: "Download raw data files for both MIND-small and EB-NeRD
+  demo/small"), not just recommended sequencing. EB-NeRD was always second
+  in *build order* (retire risk on the easier dataset first), never
+  optional. Continuing with EB-NeRD now.
+
+---
+
+## Milestone 9 — EB-NeRD acquisition, adapter, and pipeline port (2026-08-04)
+
+**What was built**
+- `configs/ebnerd_demo.yaml`: same `PipelineConfig` shape as MIND's config.
+- `scripts/download_ebnerd.py`: EB-NeRD is a **public S3 bucket, no auth**
+  (confirmed via direct HTTP HEAD before writing any code) -- much simpler
+  than MIND's gated Hugging Face flow. Downloaded `ebnerd_demo.zip`
+  (20.5 MB).
+- `src/news_reco/data/ebnerd_loader.py` / `ebnerd_adapter.py`: raw parquet
+  loaders and the transform into the common schema (`articles`,
+  `impressions`, `interactions` -- the exact same three tables MIND
+  produces). 6 unit tests on hand-crafted synthetic data, including a
+  regression test that deliberately reuses a raw `impression_id` across
+  two "splits" (mirroring Milestone 4's MIND bug) even though a direct
+  check found no actual collision in EB-NeRD's real IDs -- defensive by
+  design, not by observed necessity.
+- **Common schema extended with `published_time`** (nullable): MIND's
+  adapter now explicitly fills `NaT` for every article (previously simply
+  absent from the schema), and EB-NeRD's adapter fills real timestamps.
+  Re-ran `clean_mind.py` and the full test suite to confirm this was
+  purely additive -- 90/90 passing, unchanged row counts.
+- `scripts/clean_ebnerd.py`, and **`scripts/split_mind.py` /
+  `build_feature_store.py` reused completely unmodified** for EB-NeRD
+  (just pointed `--config` at `ebnerd_demo.yaml`) -- direct payoff of the
+  Milestone 0 architecture decision (dataset-agnostic core, dataset-specific
+  adapter). These scripts' MIND-specific names are now a known
+  inconsistency (they contain no MIND-specific logic at all); left as-is
+  for now, flagged as a polish item, not worth the churn mid-build.
+
+**Real structural differences from MIND, all verified before coding, not
+assumed**
+- `articles.parquet` is **one file shared across all splits** (not
+  split-scoped like MIND's news.tsv) -- no union/dedup needed.
+- `history` is a **separate per-user file, one per split**, and genuinely
+  *updated* between splits (a shared user's train-split history predates
+  and differs from their validation-split history) -- verified directly:
+  same user, train history ends 2023-05-15, validation history for the
+  same user ends 2023-05-20. MIND's history was static within the whole
+  observed window; EB-NeRD's is current-as-of-each-split's-start.
+- Candidates arrive as two parallel arrays (`article_ids_inview`,
+  `article_ids_clicked`), not MIND's single `"id-label"` string.
+- Articles carry a **real `published_time`**, spanning 2000-2023 (vs.
+  MIND's 6-day window) -- genuine freshness gating becomes possible,
+  unlike MIND (Milestone 10).
+- No shipped test split (EB-NeRD's real held-out test is the Codabench
+  competition's, unlabeled) -- same shape as MIND, same fix: official
+  validation -> our test, tail of official train -> our val.
+- **History is dramatically longer**: mean 288.6 articles (MIND: 33),
+  max 1,459 (MIND: 558) -- flagged before running BM25, since query cost
+  scales with history length.
+- **Zero cold-start impressions** in this bundle (every user has >=5
+  history items) -- a genuine cross-dataset difference from MIND's
+  ~2.5-3% cold-start rate, not a bug; the cold-start slice will be
+  structurally empty for EB-NeRD's demo bundle specifically.
+- **Click rate is roughly double MIND's**: 8.62% vs. 4.05%.
+
+**Split cutoffs** (verified from real data, not assumed): official train
+spans 2023-05-18 07:00 -> 2023-05-25 07:00 (7 days); official validation
+spans 2023-05-25 07:00 -> 2023-06-01 07:00 (the next 7 days, contiguous).
+`val_start = 2023-05-24 07:00:00` (last calendar day of official train,
+mirroring MIND's val = train's last day); `test_start = 2023-05-25
+07:00:00` (all of official validation, used whole, like MIND's dev).
+
+**Results**: train 21,318 / val 3,406 / test 25,356 impressions.
+Leakage check: 0.0296% violation rate (even lower than MIND's 0.053%),
+same 1% tolerance policy applied, same reasoning (truncated-observation-
+window artifact, not a pipeline bug).
+
+**Limitations**
+- `impression_id` uniqueness was checked only for the demo bundle, not the
+  full dataset -- the defensive fix (mint fresh IDs, never trust raw ones)
+  makes this a non-issue either way, but the check itself doesn't
+  generalize as a claim about the small/large bundles.
+
+**Next**
+- BM25 and semantic retrieval on EB-NeRD.
+
+---
+
+## Milestone 10 — BM25 (Danish) and semantic (multilingual) retrieval on EB-NeRD (2026-08-04)
+
+**What was built**
+- **Danish tokenization fix, caught before it caused silent damage**:
+  `tokenize()`'s original character class (`[a-z0-9]+`) is ASCII-only and
+  would have silently mangled Danish text -- "på" ("on"/"at", one of the
+  most common Danish words) tokenizes to just "p", the "å" isn't dropped
+  gracefully, it just breaks the match. Fixed by extending the pattern to
+  `[a-zæøå0-9]+`. Caught while writing `DANISH_STOPWORDS`, before ever
+  running it against real data -- an early draft of the stopword list used
+  *romanized* approximations ("paa", "naar") that would never have matched
+  anything, silently making the whole stopword list a no-op. Both are
+  covered by new tests (`test_tokenize_preserves_danish_special_characters`,
+  `test_tokenize_with_danish_stopwords_drops_danish_function_words`).
+- `tokenize()` and `BM25Index` both take a `stopwords` parameter now
+  (default: English `STOPWORDS`) rather than hardcoding one language --
+  `evaluate_bm25_recall.py` gained a `--language {en,da}` flag selecting
+  the right set, one script for both datasets.
+- `compute_article_embeddings.py` gained a `--model` flag (was hardcoded
+  to the English model) -- EB-NeRD's embeddings computed with
+  `paraphrase-multilingual-mpnet-base-v2` (768-dim), the multilingual
+  sibling of MIND's `all-mpnet-base-v2`, same methodology, same
+  architecture, per the student's explicit choice to compute embeddings
+  ourselves rather than use EB-NeRD's provided word2vec/BERT artifacts.
+- `evaluate_semantic_recall.py` needed **zero changes** for EB-NeRD --
+  embeddings are language-agnostic once computed, so the existing script
+  just worked pointed at a different config.
+
+**Performance, profiled before running anything long (lesson carried over
+from Milestone 6)**: despite ~9x longer average queries than MIND, BM25
+search is actually *faster* per query on EB-NeRD (~11ms mean vs. MIND's
+~67ms) -- EB-NeRD's catalog (11,777 articles) is ~5.5x smaller than
+MIND's (65,238), so postings lists are shorter even though queries touch
+more terms; that dominates. Full val run (3,406 impressions) completed in
+well under a minute, no background execution or caching optimizations
+needed.
+
+**Results (val split, n=3,406, 0 excluded -- no cold-start impressions in
+this bundle)**
+
+| Method | recall@50 | recall@100 | recall@200 |
+|---|---|---|---|
+| BM25 (Danish stopwords) | 0.0038 | 0.0103 | 0.0220 |
+| Semantic (multilingual) | 0.0132 | 0.0232 | 0.0364 |
+
+**Semantic beats BM25 at every K, replicating MIND's pattern on a
+completely different dataset, language, and catalog scale** -- meaningful
+cross-dataset evidence that this isn't a MIND-specific artifact of the
+particular model/corpus, though a formal paired-bootstrap comparison
+(Milestone 8's rigor) for EB-NeRD is still pending, alongside the AUC/MRR/
+nDCG/beyond-accuracy/slice work Milestone 11 will bring over.
+
+**Next**
+- Freshness gating (real, not deferred, this time -- EB-NeRD has
+  `published_time`) and the full evaluation harness (AUC/MRR/nDCG,
+  beyond-accuracy, paired bootstrap) ported to EB-NeRD.
+
+---
+
+## Milestone 11 — Freshness gating and full evaluation on EB-NeRD (2026-08-04)
+
+**What was built**
+- `src/news_reco/retrieval/availability.py`: `AvailabilityGate` --
+  precomputes a sorted (published_time, article_id) array once, then
+  answers "which articles were published at or before time T" via binary
+  search (`np.searchsorted`) rather than filtering the whole articles
+  table per impression. Refuses to construct itself from a dataset with no
+  published_time data at all (MIND) rather than silently gating nothing.
+- `BM25Index.search()` and `EmbeddingIndex.search()` both gained an
+  `eligible_doc_ids` parameter (default `None`, fully backward compatible
+  -- every existing caller and test kept working unmodified). Ineligible
+  documents are masked out *before* top-k selection (BM25: skipped during
+  the postings scan; embeddings: scored `-inf` and excluded), so an
+  ineligible document can never displace an eligible one, and `top_k` is
+  capped to the eligible count so a small eligible pool doesn't pad the
+  result with excluded entries. 8 new tests.
+- `evaluate_full.py` gained `--language {en,da}` (BM25 stopwords) and
+  `--gate-freshness` (restricts open-corpus retrieval to articles
+  published by each impression's own time) -- one script now serves both
+  the "with" and "without" runs the anti-gaming clause asks for, via a
+  flag, not a separate script.
+
+**Design decision: gating applies to open-corpus retrieval, not
+candidate-set scoring.** `score_documents()` (used for AUC/MRR/nDCG over
+an impression's *actual shown* candidates) is deliberately never gated --
+those candidates were genuinely shown to a real user by the real EB-NeRD
+production system, which by definition never shows an unpublished
+article. Gating only matters for *our own* open-corpus `search()`, which
+reaches into the whole 11,777-article catalog including articles that, at
+a given impression's time, didn't exist yet.
+
+**Design decision: query caching disabled under gating.** The existing
+query-text cache (safe when ungated, since two impressions with identical
+history get identical results) becomes unsafe once results depend on
+*time* too -- the same history at two different impression times can have
+different eligible sets. Rather than build a time-aware cache key,
+disabled caching entirely when `--gate-freshness` is set: EB-NeRD's scale
+makes every query fast enough uncached that the cache was a nice-to-have,
+not a requirement (profiled: cached val run and uncached val run both
+completed in well under a minute; the uncached full *test* run took over
+5 minutes precisely because it's ~7.4x more impressions with no caching
+at all, not because gating itself is expensive per query).
+
+**Results (val split, n=3,406) -- the "with vs. without" comparison itself**
+
+| Method | recall@200 (ungated) | recall@200 (gated) |
+|---|---|---|
+| BM25 | 0.0220 | **0.0255** |
+| Semantic | 0.0364 | **0.0414** |
+| Hybrid | 0.0326 | **0.0379** |
+
+AUC/MRR/nDCG are **identical** between gated and ungated runs (by design
+-- they score the real shown candidate set, already implicitly gated by
+reality). Catalog coverage drops slightly under gating (BM25: 0.1114 ->
+0.1096; semantic: 0.0477 -> 0.0468).
+
+**The genuinely interesting finding: gating *improves* recall@K, it
+doesn't just make retrieval "more honest."** This is not obvious --
+restricting the candidate pool could easily have hurt recall by removing
+options. Investigated rather than just reported: the catalog spans
+2000-2023 (23 years), so at any given impression's time, a large fraction
+of the "always eligible regardless of gating" articles are old, and a
+meaningful number of *not-yet-published* articles can still score highly
+on lexical/semantic similarity despite being impossible answers (the true
+click, by construction, must already exist). Removing those impostor
+candidates from competition for the top-K slots makes room for genuinely
+eligible candidates -- including the true click -- to rise into it. In
+other words: **the ungated numbers were quietly pessimistic**, diluted by
+candidates that could never have been the right answer. This directly
+answers the anti-gaming clause's "with and without" requirement with a
+concrete, explained direction of effect, not just two numbers side by side.
+
+**Paired bootstrap (semantic vs. BM25, AUC, val)**: mean diff 0.0270, 95%
+CI [0.0127, 0.0407] -- excludes zero, semantic significantly better,
+replicating MIND's finding on a completely different dataset and
+language. (Unaffected by gating, per the design decision above -- AUC is
+computed on the same fixed candidate set either way.)
+
+**Head/tail pattern is less consistent here than on MIND**: BM25 and
+hybrid both show *head* impressions scoring higher on AUC (BM25: head
+0.5576 vs. tail 0.5145) -- the reverse of MIND's tail-favoring pattern --
+while semantic shows next to no head/tail gap on AUC (0.5310 vs. 0.5450).
+recall@K strongly favors head for all three methods, consistent with
+MIND. Flagged as a genuine cross-dataset difference worth discussing in
+the design note, not smoothed over to match MIND's story.
+
+**Test-split (held-out, final) results, n=25,356**
+
+| Method | recall@200 (ungated) | recall@200 (gated) |
+|---|---|---|
+| BM25 | 0.0257 | **0.0286** |
+| Semantic | 0.0242 | **0.0268** |
+| Hybrid | 0.0232 | **0.0262** |
+
+The gating-improves-recall effect **replicates on genuinely held-out
+data** for every method -- strong evidence this is a real, robust
+phenomenon (impossible-candidate dilution in an open-corpus retrieval
+setup with a decades-wide catalog), not an artifact of val's particular
+impressions. AUC/MRR/nDCG are again identical gated vs. ungated, as
+designed. Paired bootstrap (semantic vs. BM25, AUC, test, n=25,356): mean
+diff 0.0117, 95% CI [0.0065, 0.0176] -- smaller margin than val's 0.0270
+but still clearly significant.
+
+**Cross-dataset comparison worth naming explicitly**: semantic
+significantly beats BM25 on both MIND (AUC diff 0.0880, test) and EB-NeRD
+(AUC diff 0.0117, test) -- same direction, very different magnitude.
+Plausible reading, not yet verified further: EB-NeRD's multilingual model
+and 23-year-wide catalog present a harder generalization problem than
+MIND's English-only, 6-day catalog, or the smaller margin simply reflects
+EB-NeRD's much smaller demo-bundle catalog compressing the gap between
+methods. Worth a real investigation (like the val/test recall@K
+investigation in Milestone 8) if time allows before the design note, not
+asserted as settled here.
+
+**Next**
+- Component 1 now covers both required datasets end-to-end: pipeline,
+  temporal split with leakage checks, feature store, evaluation harness,
+  BM25 (English + Danish), semantic retrieval (English + multilingual),
+  hybrid, beyond-accuracy metrics, head/tail and cold-start slicing, paired
+  bootstrap significance, and -- for EB-NeRD specifically, since MIND
+  structurally can't support it -- freshness gating with a real "with vs.
+  without" comparison. Remaining C1 work: design note (<=4 pages),
+  Codabench submission generation, EB-NeRD's ebnerd_small bundle (currently
+  only the demo bundle has been run) if time allows before the deadline.
