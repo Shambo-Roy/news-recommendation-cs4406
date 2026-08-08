@@ -1,0 +1,18 @@
+# Configuration for the EB-NeRD small bundle.
+# Paths below are relative to the project root; load_config() resolves them
+# to absolute paths so scripts behave the same regardless of the working
+# directory they're launched from.
+
+dataset_name: ebnerd_small
+raw_dir: data/raw/ebnerd_small
+interim_dir: data/interim/ebnerd_small
+processed_dir: data/processed/ebnerd_small
+random_seed: 42
+
+# Same time window as ebnerd_demo (configs/ebnerd_demo.yaml) -- demo and
+# small are both subsets of the same underlying collection period, only the
+# user/impression counts differ. Verified identical train/validation date
+# boundaries in the small bundle's raw files before reusing these cutoffs
+# (see reports/engineering_log.md, Milestone 12).
+val_start: "2023-05-24 07:00:00"
+test_start: "2023-05-25 07:00:00"
