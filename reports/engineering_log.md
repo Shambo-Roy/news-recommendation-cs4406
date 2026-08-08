@@ -1117,3 +1117,103 @@ asserted as settled here.
   without" comparison. Remaining C1 work: design note (<=4 pages),
   Codabench submission generation, EB-NeRD's ebnerd_small bundle (currently
   only the demo bundle has been run) if time allows before the deadline.
+
+## Milestone 12: EB-NeRD small bundle -- scaling up from demo (in progress)
+
+`ebnerd_small` is ~13x demo's article count and ~30x its interaction
+volume -- close to the real Codabench submission scale, so results here
+carry more weight than the demo bundle's for the design note.
+
+- `configs/ebnerd_small.yaml` added. Verified the small bundle's raw
+  `impression_time` range **before** trusting the demo config's cutoffs:
+  train 2023-05-18 07:00:01 -> 2023-05-25 06:59:58, validation 2023-05-25
+  07:00:02 -> 2023-06-01 06:59:59 -- byte-identical boundaries to demo (demo
+  and small are both subsets of the same collection window, differing only
+  in user count), so `val_start`/`test_start` carried over unchanged rather
+  than re-derived blind.
+- `download_ebnerd.py --bundle small` and `clean_ebnerd.py --bundle small`
+  both needed **zero code changes** -- the `--bundle` parameter was
+  already there from Milestone 9, another payoff of not hardcoding "demo"
+  anywhere in the pipeline scripts.
+- Clean output: 20,738 articles, 477,534 impressions, 5,514,689
+  interactions, click rate 0.0869, 0 articles missing `published_time`.
+- Split: train 200,328 / val 32,559 / test 244,647 impressions. Leakage
+  check over 139.4M history entries: 0.0439% genuine future-click
+  violations -- within tolerance, and notably *lower* than demo's rate,
+  consistent with a larger, less sparse history population.
+- Feature store: 0 cold-start impressions across all three splits (every
+  user has some history) -- same shape as the demo bundle.
+- Multilingual embeddings computed for all 20,738 articles
+  (`paraphrase-multilingual-mpnet-base-v2`, ~7 min on CPU, batch size 64).
+
+**Design decision: defer the full `evaluate_full.py` sweep.** Timed it
+directly rather than guessing: 2,000 val impressions with
+`--gate-freshness` took 82s (0.041s/impression), which extrapolates to
+~22 min for full val (32,559) and ~2.5-3 hours for full test (244,647) --
+*per pass*, and the with/without-gating comparison needs two passes each.
+Flagged the ~5-6 hour total compute cost to the user rather than launching
+it silently; decision was to hold off and run the full test-split sweep
+in a later session, since this bundle is an enhancement beyond the
+required demo-bundle results, not a blocker for the required deliverable.
+Recall@K-only evaluation (`evaluate_bm25_recall.py`,
+`evaluate_semantic_recall.py`) is comparatively cheap and remains a
+candidate to run first next session, ahead of the full AUC/nDCG/bootstrap
+sweep.
+
+**Full `evaluate_full.py` sweep, run next session as planned** (val +
+test, gated + ungated). Ran all four passes concurrently as separate
+background processes rather than sequentially -- 20 logical cores
+available, and each pass is CPU-bound but largely single-process, so
+contention was minor. All four completed; test-ungated (which keeps query
+caching) actually finished before test-gated despite starting at the same
+time, consistent with the Milestone 11 profiling note that caching, not
+gating itself, is what saves time at this scale.
+
+**Val results (n=32,559)**
+
+| Method | recall@200 ungated | recall@200 gated | AUC ungated |
+|---|---|---|---|
+| BM25 | 0.0140 | **0.0156** | 0.5225 |
+| Semantic | 0.0283 | **0.0304** | 0.5400 |
+| Hybrid | 0.0230 | **0.0255** | 0.5396 |
+
+Paired bootstrap (semantic vs. BM25, AUC): mean diff 0.0175, 95% CI
+[0.0129, 0.0222] -- significant.
+
+**Test results (held-out, n=244,647)**
+
+| Method | recall@200 ungated | recall@200 gated | AUC ungated |
+|---|---|---|---|
+| BM25 | 0.0183 | **0.0196** | 0.5205 |
+| Semantic | 0.0146 | **0.0155** | 0.5344 |
+| Hybrid | 0.0159 | **0.0169** | 0.5346 |
+
+Paired bootstrap (semantic vs. BM25, AUC, test): mean diff 0.0139, 95% CI
+[0.0121, 0.0156] -- significant.
+
+**Both findings from the demo bundle replicate at ~13x the article count
+and ~10x the impression count:**
+1. Freshness gating improves recall@200 for every method, on both val and
+   held-out test -- the impossible-candidate-dilution effect isn't a
+   demo-bundle artifact.
+2. Semantic significantly outperforms BM25 on AUC, on both val and test.
+   The small-bundle test margin (0.0139) sits between the demo bundle's
+   test margin (0.0117) and MIND's (0.0880) -- consistent with the
+   Milestone 11 hypothesis that catalog/language difficulty, not dataset
+   noise, drives the gap size, though still not confirmed by a targeted
+   investigation.
+
+One reversal worth flagging honestly, not smoothing over: on the *demo*
+bundle's test split, semantic's recall@200 (0.0242) was *below* BM25's
+(0.0257); on the *small* bundle's test split the same pattern holds even
+more strongly (semantic 0.0146 vs. BM25 0.0183) -- semantic wins on
+ranking quality (AUC) but loses to BM25 on open-corpus recall at this K,
+on both bundles' test splits, even though semantic wins recall@200 on
+*val* for both bundles. Plausible reading: test's candidate articles skew
+toward very recent/novel content that lexical overlap with a user's
+history (BM25) catches better than semantic similarity to older
+history-embeddings does, especially before freshness gating removes the
+even-newer distractors -- worth a real investigation before the design
+note, not asserted as settled here.
+
+**Next**: design note (<=4 pages), Codabench submission generation.
