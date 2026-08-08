@@ -1217,3 +1217,33 @@ even-newer distractors -- worth a real investigation before the design
 note, not asserted as settled here.
 
 **Next**: design note (<=4 pages), Codabench submission generation.
+
+## build_pipeline.py: closing the EB-NeRD gap
+
+`build_pipeline.py` (Milestone 4) was written for MIND only -- a hardcoded
+4-stage list, and every subprocess call passed `--config` alone. It never
+worked for EB-NeRD, since `download_ebnerd.py`/`clean_ebnerd.py` also need
+a `--bundle {demo,small}` flag the script never supplied.
+
+**Design decision: infer dataset family + bundle from the config's
+`dataset_name`, not a new CLI flag.** `configs/ebnerd_small.yaml`'s
+`dataset_name: ebnerd_small` already encodes both facts a stage-selector
+needs ("this is EB-NeRD" and "the small bundle"); asking for a `--bundle`
+flag on top would let the two answers disagree with no validation catching
+it. `resolve_stages()` parses `dataset_name` (`mind_small` -> the MIND
+stage list; `ebnerd_{demo,small}` -> the EB-NeRD stage list with `--bundle`
+threaded through only to the download/clean stages; anything else ->
+`ValueError` with the recognized values named) and keeps
+`split_mind.py`/`build_feature_store.py` un-parameterized, since they're
+already dataset-agnostic.
+
+Verified two ways: `resolve_stages()` checked directly against all three
+real configs plus two invalid `dataset_name` values (both raise with a
+clear message); then a full real run of
+`python scripts/build_pipeline.py --config configs/ebnerd_demo.yaml`
+end-to-end (download -> clean -> split -> feature store) reproduced
+**byte-identical stats** to the original Milestone 9 demo-bundle run
+(11,777 articles; split 21,318/3,406/25,356; 0.0296% leakage rate) --
+confirms both the new wiring is correct and the whole pipeline is
+genuinely reproducible from raw download alone, not just from
+already-cleaned intermediate files.

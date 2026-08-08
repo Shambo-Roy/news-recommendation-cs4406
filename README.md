@@ -29,20 +29,21 @@ granted to the [MIND dataset repo](https://huggingface.co/datasets/yjw1029/MIND)
 `.venv\Scripts\huggingface-cli login` once). EB-NeRD is a public S3 bucket
 and needs no authentication.
 
-## One-command rebuild (MIND)
+## One-command rebuild
 
 ```bash
 python scripts/build_pipeline.py --config configs/mind_small.yaml
+python scripts/build_pipeline.py --config configs/ebnerd_demo.yaml
+python scripts/build_pipeline.py --config configs/ebnerd_small.yaml
 ```
 
-Downloads MIND-small, cleans it into the common schema, assigns the
+Downloads the dataset, cleans it into the common schema, assigns the
 temporal train/val/test split with leakage checks, and materializes the
-feature store — end to end, from nothing but the config file. Each stage
-is also independently runnable (see below) and independently tested.
-
-EB-NeRD doesn't have a chained one-command script yet (its extra `--bundle
-{demo,small}` flag on the download/clean stages doesn't fit the current
-`build_pipeline.py` shape) — run its stages individually as shown below.
+feature store — end to end, from nothing but the config file. Works for
+both datasets: which stage list (and, for EB-NeRD, which bundle) to run is
+inferred from the config's own `dataset_name` field, not a separate flag.
+Each stage is also independently runnable (see below) and independently
+tested.
 
 ## Pipeline stages
 
