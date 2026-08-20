@@ -1247,3 +1247,159 @@ end-to-end (download -> clean -> split -> feature store) reproduced
 confirms both the new wiring is correct and the whole pipeline is
 genuinely reproducible from raw download alone, not just from
 already-cleaned intermediate files.
+
+## Milestone 13: Codabench submission generation
+
+The assignment requires registering for and submitting predictions to
+both official leaderboards (MIND Competition, Codabench #13967; RecSys
+2024 / EB-NeRD Challenge, Codabench #2469) -- not stretch work, a
+mandatory deliverable, grading not on rank but on having submitted.
+Researched both competitions' submission-guidelines pages directly (not
+assumed) before writing any code.
+
+**Format, confirmed from each competition's own page**: a zip containing
+exactly one file (`prediction.txt` for MIND, `predictions.txt` for
+EB-NeRD; no folders, no other files) with one line per impression:
+`impression_id [rank1,rank2,...,rankN]`, ranks positional against the
+candidate list in the source file's own order, 1-indexed, rank 1 = best.
+Both competitions' real test sets are genuinely unlabeled (no click
+ground truth locally available) -- the submission's only job is a
+correctly formatted ranking, not a locally-verifiable accuracy number.
+
+**Design decision: rank by semantic similarity, not BM25 or hybrid.**
+Chose semantic because it's the method with significant, reproducible AUC
+gains over BM25 in every logged comparison on both datasets (Milestones 8,
+11, 12), and both competitions score AUC as a primary or the primary
+metric. Considered hybrid (RRF); rejected since it never clearly beat
+semantic on AUC in this project's own results, so it wasn't the option
+the evidence actually supported.
+
+**Official test sets are structurally different from train/dev/val**:
+both ship the real candidate list with no click labels at all (MIND:
+bare `impressions` column, no "-0"/"-1" suffix; EB-NeRD: no
+`article_ids_clicked` column in the test behaviors file whatsoever).
+Added `parse_unlabeled_behaviors()` to both `mind_adapter.py` and
+`ebnerd_adapter.py` -- deliberately much thinner than
+`build_impressions_and_interactions()` (nothing to explode into an
+interactions table), and deliberately keeps the *raw* impression_id
+rather than re-minting a global one, since the submission file must
+reference exactly the IDs the official scorer expects -- silently
+renumbering them here would corrupt every submission. New
+`src/news_reco/submission.py` holds the dataset-agnostic pieces
+(`scores_to_ranks`, `write_prediction_file`, `zip_prediction_file`), unit
+tested against a worked example taken directly from EB-NeRD's own
+submission-guidelines page.
+
+**Real bug caught by the tests, not guessed**: `write_prediction_file`'s
+first version opened the output file in plain text mode, which silently
+writes CRLF line endings on Windows. A test asserting the zip's raw bytes
+(not `Path.read_text()`, which normalizes newlines back to `\n` and would
+have hidden this) caught `'1 [1]\r\n' != '1 [1]\n'`. Fixed with
+`newline="\n"` on the file open. Worth naming: this would have shipped a
+subtly malformed submission to a Unix-based scorer without ever failing a
+test that used the wrong assertion method.
+
+**Real bug reproduced, not just fixed once**: the embeddings-cache
+`.npz` save hit the exact same object-array bug from Milestone 7
+(`.astype(str).to_numpy()` keeps a pandas object dtype; `np.load(...,
+allow_pickle=False)` then refuses it) -- reproduced here by writing the
+two casts in the wrong order in a new script. Caught immediately on the
+first real run (not a silent latent bug), after already having encoded
+120,959 articles over 76 minutes. Repaired the cache file in place
+(`allow_pickle=True` on a file this pipeline itself had just generated,
+same reasoning as Milestone 7: self-generated and trusted, not an
+untrusted external file) rather than re-encoding, and fixed the actual
+bug in both submission scripts for the run that mattered.
+
+**MIND submission**: MINDlarge_test (2,370,727 impressions, 120,959
+articles) is on the same gated Hugging Face repo already authenticated
+for MIND-small -- no new access needed. Catalog embeddings: 76 min
+one-time. Ranking, once embeddings were cached: 545.8s for all 2.37M
+impressions (0.23ms/impression) -- the per-impression scoring loop was
+never the bottleneck. Output validated two ways: every sampled line is a
+genuine 1..N permutation, and the file's raw bytes confirmed LF-only line
+endings.
+
+**EB-NeRD submission -- a real production-scale failure, not just a
+slow run.** The official `ebnerd_testset` is far larger than anything
+this project had handled: 13,536,710 impressions, an 807,677-row history
+file, 125,541 articles. The first version of
+`generate_ebnerd_submission.py` mirrored the MIND script's structure
+(load everything into memory with pandas, build a Python history-ID list
+per impression, accumulate every result before writing) and **crashed the
+whole machine** -- not just the Python process -- twice, confirmed by the
+user directly (system genuinely restarting mid-run, no other processes
+competing for resources). Root-caused rather than just retried blindly:
+`parse_unlabeled_behaviors()` built a *fresh* Python list of history
+article-ID strings for *every one of 13.5M impressions*, even though
+impressions massively share users (whose history doesn't change within
+this snapshot) -- on the order of a billion small Python string objects
+against a 16GB machine with under 10GB free. This is the same class of
+mistake Milestone 6 (BM25 performance) had already surfaced once for a
+different reason (recomputing instead of reusing what's shared across
+queries), now at a scale where it took the OS down instead of just being
+slow.
+
+Fixed by redesigning around three changes, not by asking for a bigger
+machine:
+1. **Precompute one mean-pooled query embedding per user up front** (a
+   flat `(807_677, 768)` float32 matrix, built once) instead of a raw
+   history-ID list rebuilt per impression. Replaces up to ~13.5M list
+   constructions with one pass over 807,677 users.
+2. **Column-pruned the history read** (`user_id`, `article_id_fixed`
+   only) -- history.parquet also carries `impression_time_fixed`,
+   `scroll_percentage_fixed`, and `read_time_fixed` arrays this script
+   never uses, and loading them was pure waste.
+3. **Streamed behaviors.parquet in 200K-row batches** via
+   `pyarrow.parquet.ParquetFile.iter_batches()` and wrote predictions
+   incrementally (`write_prediction_file` already accepted an `Iterable`,
+   so this needed no change to the shared helper) instead of
+   materializing all 13.5M results before writing anything.
+
+Verified safety before re-attempting the full run: a 3,000-impression
+smoke test completed in ~100s with correct output, confirming the new
+code path worked before committing machine time to it again. Full run:
+97.6s to precompute all 807,677 users' query embeddings, then 333.4s
+(0.02ms/impression, even faster per-impression than MIND) to stream-rank
+and write all 13,536,710 impressions -- **no crash**, flat memory
+throughout. Output validated the same way as MIND's: exact expected line
+count, a 5,000-line random sample all verified as genuine permutations,
+raw-byte LF-ending check.
+
+**Official Codabench leaderboard results** (both submissions registered,
+uploaded, and scored by the user):
+
+| Competition | AUC | MRR | nDCG@5 | nDCG@10 |
+|---|---|---|---|---|
+| MIND (MINDlarge_test) | 0.6544 | 0.3212 | 0.3465 | 0.4023 |
+| EB-NeRD (ebnerd_testset) | 0.5349 | 0.3413 | 0.3785 | 0.4579 |
+
+**Compared against this project's own local validation, as a sanity
+check on the whole pipeline** (not just the ranking code, but the
+download -> catalog -> embed -> score -> format -> zip chain end to end):
+
+| | AUC | MRR | nDCG@5 | nDCG@10 |
+|---|---|---|---|---|
+| MIND local (MIND-small test, n=70,938) | 0.6518 | 0.3592 | 0.3435 | 0.4028 |
+| MIND official (MINDlarge_test) | 0.6544 | 0.3212 | 0.3465 | 0.4023 |
+| EB-NeRD local (ebnerd_small test, n=244,647) | 0.5344 | 0.3402 | 0.3741 | 0.4546 |
+| EB-NeRD official (ebnerd_testset) | 0.5349 | 0.3413 | 0.3785 | 0.4579 |
+
+EB-NeRD's official score is essentially identical to the local number
+across all four metrics (largest gap 0.0044, on nDCG@10) -- strong,
+independent confirmation that the local evaluation harness, the
+official-test adapter, and the scoring/ranking code are all correct and
+consistent with each other, from a scorer this project has no control
+over. MIND's AUC and nDCG both land within ~0.003 of the local number
+too, but MRR is a real, honest gap (0.3212 official vs. 0.3592 local, a
+drop of ~0.038) worth naming rather than smoothing over -- MRR is the
+metric most sensitive to getting the single top-ranked item exactly
+right, and MINDlarge_test's candidate lists come from the full ~161K
+MIND catalog rather than MIND-small's ~51K, so a harder, larger, more
+diverse candidate pool per impression is a plausible explanation, though
+not independently verified here (would need re-running local evaluation
+against MINDlarge's own train/dev, not MIND-small, to isolate catalog
+scale from any other difference between the two data slices).
+
+**Next**: the design note (<=4 pages), the last remaining Component 1
+deliverable.

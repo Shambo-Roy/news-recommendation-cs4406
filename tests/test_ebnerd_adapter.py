@@ -11,7 +11,11 @@ Run with: pytest tests/test_ebnerd_adapter.py -v
 import numpy as np
 import pandas as pd
 
-from news_reco.data.ebnerd_adapter import build_articles_table, build_impressions_and_interactions
+from news_reco.data.ebnerd_adapter import (
+    build_articles_table,
+    build_impressions_and_interactions,
+    parse_unlabeled_behaviors,
+)
 
 
 def test_build_articles_table_maps_columns_correctly():
@@ -105,3 +109,27 @@ def test_build_impressions_and_interactions_cold_start_user_gets_empty_history()
 
     assert impressions.iloc[0]["history"] == []
     assert interactions.iloc[0]["clicked"] == 0
+
+
+def test_parse_unlabeled_behaviors_keeps_raw_impression_id_and_bare_candidates():
+    # Codabench's official ebnerd_testset/test/behaviors.parquet has no
+    # article_ids_clicked column at all -- genuinely unlabeled.
+    behaviors = pd.DataFrame(
+        {
+            "impression_id": [501, 502],  # must survive unchanged: the scorer expects these exact IDs
+            "user_id": [1, 999],  # 999 has no history row -- cold start
+            "article_ids_inview": [np.array([10, 11, 12]), np.array([20])],
+        }
+    )
+    history = pd.DataFrame({"user_id": [1], "article_id_fixed": [np.array([1, 2])]})
+
+    parsed = parse_unlabeled_behaviors(behaviors, history)
+
+    assert list(parsed["impression_id"]) == [501, 502]  # not re-minted
+    row1 = parsed.set_index("impression_id").loc[501]
+    assert row1["history"] == ["1", "2"]
+    assert row1["candidates"] == ["10", "11", "12"]
+
+    row2 = parsed.set_index("impression_id").loc[502]
+    assert row2["history"] == []  # cold-start user, absent from history_df
+    assert row2["candidates"] == ["20"]
