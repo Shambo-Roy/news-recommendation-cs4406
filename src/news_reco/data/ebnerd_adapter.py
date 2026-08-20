@@ -114,3 +114,33 @@ def build_impressions_and_interactions(
     interactions_table = pd.concat(all_interactions, ignore_index=True)[INTERACTIONS_COLUMNS]
 
     return impressions_table.reset_index(drop=True), interactions_table.reset_index(drop=True)
+
+
+def parse_unlabeled_behaviors(behaviors_df: pd.DataFrame, history_df: pd.DataFrame) -> pd.DataFrame:
+    """Parse EB-NeRD's official *unlabeled* test behaviors+history (Codabench's
+    ebnerd_testset) into one row per impression, with a bare candidate list.
+
+    Unlike build_impressions_and_interactions() (used for train/validation,
+    which carry article_ids_clicked), the official test behaviors.parquet has
+    no clicked column at all -- genuinely unlabeled, since it's the real
+    held-out test the competition scores against. Keeps EB-NeRD's own
+    impression_id as-is (not re-minted), matching
+    mind_adapter.parse_unlabeled_behaviors for the same reason: the
+    submission file must reference the exact IDs the official scorer
+    expects.
+    """
+    history_lookup = dict(zip(history_df["user_id"], history_df["article_id_fixed"]))
+    history_lists = [
+        [str(article_id) for article_id in history_lookup.get(user_id, [])]
+        for user_id in behaviors_df["user_id"]
+    ]
+    candidate_lists = [[str(article_id) for article_id in arr] for arr in behaviors_df["article_ids_inview"]]
+
+    return pd.DataFrame(
+        {
+            "impression_id": behaviors_df["impression_id"],
+            "user_id": behaviors_df["user_id"].astype(str),
+            "history": history_lists,
+            "candidates": candidate_lists,
+        }
+    )

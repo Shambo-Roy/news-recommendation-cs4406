@@ -11,7 +11,11 @@ Run with: pytest tests/test_mind_adapter.py -v
 
 import pandas as pd
 
-from news_reco.data.mind_adapter import build_articles_table, build_impressions_and_interactions
+from news_reco.data.mind_adapter import (
+    build_articles_table,
+    build_impressions_and_interactions,
+    parse_unlabeled_behaviors,
+)
 
 
 def _news_frame(rows: list[dict]) -> pd.DataFrame:
@@ -112,3 +116,24 @@ def test_build_impressions_and_interactions_explodes_candidates():
         )
     )
     assert imp2_candidates == {("N5", 0)}
+
+
+def test_parse_unlabeled_behaviors_keeps_raw_impression_id_and_bare_candidates():
+    # Codabench's official test behaviors.tsv has no "-0"/"-1" suffix on
+    # candidates -- just bare IDs, since there's no ground truth to encode.
+    behaviors = pd.DataFrame(
+        {
+            "impression_id": [42, 43],  # must survive unchanged: the scorer expects these exact IDs
+            "user_id": ["U1", "U2"],
+            "history": ["N1 N2", None],
+            "impressions": ["N3 N4 N5", "N6"],
+        }
+    )
+
+    parsed = parse_unlabeled_behaviors(behaviors)
+
+    assert list(parsed["impression_id"]) == [42, 43]  # not re-minted, unlike the labeled path
+    assert parsed.set_index("impression_id").loc[42, "history"] == ["N1", "N2"]
+    assert parsed.set_index("impression_id").loc[43, "history"] == []
+    assert parsed.set_index("impression_id").loc[42, "candidates"] == ["N3", "N4", "N5"]
+    assert parsed.set_index("impression_id").loc[43, "candidates"] == ["N6"]

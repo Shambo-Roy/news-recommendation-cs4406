@@ -110,3 +110,29 @@ def build_impressions_and_interactions(
     )[INTERACTIONS_COLUMNS].reset_index(drop=True)
 
     return impressions, interactions
+
+
+def parse_unlabeled_behaviors(behaviors_df: pd.DataFrame) -> pd.DataFrame:
+    """Parse a raw *unlabeled* MIND behaviors frame (Codabench's official test
+    set) into one row per impression, with a bare candidate-ID list.
+
+    Codabench's official MINDlarge_test/behaviors.tsv has no "-0"/"-1" click
+    labels on its `impressions` column -- it's genuinely unlabeled, since
+    it's the real held-out test the competition scores against. There's
+    nothing to explode into an interactions table (no ground truth to
+    store), so this is a much thinner parse than
+    build_impressions_and_interactions().
+
+    Deliberately keeps MIND's own impression_id as-is, unlike the
+    internal pipeline's global re-minting -- the submission file must
+    reference the exact IDs the official scorer expects, so silently
+    renumbering them here would corrupt every submission.
+    """
+    return pd.DataFrame(
+        {
+            "impression_id": behaviors_df["impression_id"],
+            "user_id": behaviors_df["user_id"],
+            "history": behaviors_df["history"].apply(_parse_history),
+            "candidates": behaviors_df["impressions"].str.split(),
+        }
+    )
