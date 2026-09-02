@@ -1,0 +1,36 @@
+# GBDT re-ranker config for EB-NeRD-small, GATED variant (Component 2,
+# Assignment 2 anti-gaming requirement: "report metrics with and without
+# features unavailable at serving time").
+#
+# Identical to configs/gbdt_ebnerd_small.yaml except gate_freshness: true
+# and separate model_dir/feature_table_dir -- gating changes WHICH
+# candidates survive per impression (a not-yet-published candidate is
+# dropped entirely, not just NaN'd), so the feature tables themselves
+# differ from the ungated run and cannot share a cache.
+base_config: configs/ebnerd_small.yaml
+
+language: da
+gate_freshness: true  # the only difference from configs/gbdt_ebnerd_small.yaml
+random_seed: 42
+
+model_dir: data/processed/ebnerd_small/gbdt_gated
+feature_table_dir: data/interim/ebnerd_small/gbdt_features_gated
+
+# Same hyperparameters as the ungated config -- isolating the effect of
+# gating alone, not also changing the model.
+lightgbm_params:
+  objective: lambdarank
+  metric: ndcg
+  n_estimators: 200
+  num_leaves: 31
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  subsample_freq: 1
+  colsample_bytree: 0.8
+  min_child_samples: 20
+  random_state: 42
+  n_jobs: -1
+  verbose: -1
+
+early_stopping_rounds: 20

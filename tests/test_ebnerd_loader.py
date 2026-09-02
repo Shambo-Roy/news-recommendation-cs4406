@@ -2,7 +2,7 @@
 
 These tests run against the real downloaded EB-NeRD demo bundle, so they
 are skipped (not failed) if it hasn't been downloaded yet. Run
-scripts/download_ebnerd.py first.
+scripts/data/download_ebnerd.py first.
 
 Run with: pytest tests/test_ebnerd_loader.py -v
 """
@@ -20,7 +20,7 @@ DEMO_DIR = CONFIG.raw_dir / "demo"
 
 pytestmark = pytest.mark.skipif(
     not DEMO_DIR.exists(),
-    reason="EB-NeRD demo bundle not downloaded yet -- run scripts/download_ebnerd.py first",
+    reason="EB-NeRD demo bundle not downloaded yet -- run scripts/data/download_ebnerd.py first",
 )
 
 

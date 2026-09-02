@@ -53,7 +53,7 @@ from news_reco.data.ebnerd_loader import load_articles
 from news_reco.retrieval.semantic.embeddings import EmbeddingIndex, compute_embeddings
 from news_reco.submission import scores_to_ranks, write_prediction_file, zip_prediction_file
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 RAW_DIR = PROJECT_ROOT / "data" / "raw" / "ebnerd_testset" / "ebnerd_testset"
 INTERIM_DIR = PROJECT_ROOT / "data" / "interim" / "ebnerd_testset"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "processed" / "ebnerd_testset"

@@ -1,0 +1,32 @@
+# GBDT re-ranker config for EB-NeRD-small (Component 2).
+# Points at Component 1's own dataset config rather than duplicating its
+# fields -- val_start/test_start, raw/interim/processed paths, and
+# random_seed for the DATA pipeline all still come from base_config.
+base_config: configs/ebnerd_small.yaml
+
+language: da          # DANISH_STOPWORDS
+gate_freshness: false # ungated by default -- see docs/gbdt_reranker.md for the gated-mode comparison run
+random_seed: 42       # LightGBM's own seed; independent of base_config's split seed
+
+model_dir: data/processed/ebnerd_small/gbdt
+feature_table_dir: data/interim/ebnerd_small/gbdt_features
+
+# Same conservative hyperparameters as configs/gbdt_mind_small.yaml -- kept
+# identical across datasets on purpose (Milestone 8 checks whether they
+# still perform reasonably on EB-NeRD before any dataset-specific tuning).
+lightgbm_params:
+  objective: lambdarank
+  metric: ndcg
+  n_estimators: 200
+  num_leaves: 31
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  subsample_freq: 1
+  colsample_bytree: 0.8
+  min_child_samples: 20
+  random_state: 42
+  n_jobs: -1
+  verbose: -1
+
+early_stopping_rounds: 20

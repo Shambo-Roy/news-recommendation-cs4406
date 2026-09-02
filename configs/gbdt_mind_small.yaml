@@ -1,0 +1,32 @@
+# GBDT re-ranker config for MIND-small (Component 2).
+# Points at Component 1's own dataset config rather than duplicating its
+# fields -- val_start/test_start, raw/interim/processed paths, and
+# random_seed for the DATA pipeline all still come from base_config.
+base_config: configs/mind_small.yaml
+
+language: en          # BM25 stopword list (news_reco.retrieval.lexical.bm25.STOPWORDS)
+gate_freshness: false # MIND has no publish_time data at all -- gating is not applicable/possible
+random_seed: 42       # LightGBM's own seed; independent of base_config's split seed
+
+model_dir: data/processed/mind_small/gbdt
+feature_table_dir: data/interim/mind_small/gbdt_features
+
+# Conservative, small, reproducible -- not a hyperparameter search (per the
+# assignment brief). Selected on the validation split; see
+# reports/gbdt_reranker_experiment.md for the val-based justification.
+lightgbm_params:
+  objective: lambdarank
+  metric: ndcg
+  n_estimators: 200
+  num_leaves: 31
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  subsample_freq: 1   # LightGBM requires this >0 for `subsample` (bagging_fraction) to take effect
+  colsample_bytree: 0.8
+  min_child_samples: 20
+  random_state: 42
+  n_jobs: -1
+  verbose: -1
+
+early_stopping_rounds: 20
