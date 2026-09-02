@@ -24,7 +24,7 @@ from huggingface_hub import hf_hub_download
 HF_REPO_ID = "yjw1029/MIND"
 FILENAME = "MINDlarge_test.zip"
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 RAW_DIR = PROJECT_ROOT / "data" / "raw" / "mind_large_test"
 
 

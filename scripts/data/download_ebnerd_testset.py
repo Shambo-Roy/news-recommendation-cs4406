@@ -23,7 +23,7 @@ import requests
 BASE_URL = "https://ebnerd-dataset.s3.eu-west-1.amazonaws.com"
 FILENAME = "ebnerd_testset.zip"
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 RAW_DIR = PROJECT_ROOT / "data" / "raw" / "ebnerd_testset"
 
 

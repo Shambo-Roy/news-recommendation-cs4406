@@ -1,7 +1,7 @@
 """Verification tests for the FeatureStore (Milestone 4).
 
 These run against the real cleaned + split MIND-small data, so they are
-skipped (not failed) if scripts/clean_mind.py and scripts/split_mind.py
+skipped (not failed) if scripts/data/clean_mind.py and scripts/pipeline/split_mind.py
 haven't been run yet.
 
 Run with: pytest tests/test_feature_store.py -v
@@ -20,7 +20,7 @@ SPLITS_PATH = CONFIG.processed_dir / "impression_splits.parquet"
 
 pytestmark = pytest.mark.skipif(
     not SPLITS_PATH.exists(),
-    reason="Cleaned/split data not present -- run scripts/clean_mind.py and scripts/split_mind.py first",
+    reason="Cleaned/split data not present -- run scripts/data/clean_mind.py and scripts/pipeline/split_mind.py first",
 )
 
 

@@ -13,14 +13,14 @@ EB-NeRD" and "the small bundle", so asking for that information twice
 would just invite the two answers to disagree.
 
 Usage:
-    python scripts/build_pipeline.py --config configs/mind_small.yaml
-    python scripts/build_pipeline.py --config configs/ebnerd_demo.yaml
-    python scripts/build_pipeline.py --config configs/ebnerd_small.yaml
+    python scripts/pipeline/build_pipeline.py --config configs/mind_small.yaml
+    python scripts/pipeline/build_pipeline.py --config configs/ebnerd_demo.yaml
+    python scripts/pipeline/build_pipeline.py --config configs/ebnerd_small.yaml
 
 Note: MIND's download step requires `huggingface-cli login` to have been
-run once already (see scripts/download_mind_small.py's docstring) -- this
-script does not perform that authentication itself. EB-NeRD's download
-needs no authentication.
+run once already (see scripts/data/download_mind_small.py's docstring) --
+this script does not perform that authentication itself. EB-NeRD's
+download needs no authentication.
 """
 
 from __future__ import annotations
@@ -32,13 +32,16 @@ from pathlib import Path
 
 from news_reco.utils.config import load_config
 
-SCRIPTS_DIR = Path(__file__).resolve().parent
+# scripts/ itself -- one level up from this file (scripts/pipeline/) -- so
+# each stage below is addressed as "<subfolder>/<script>.py", matching the
+# scripts/{data,pipeline,evaluation,submission,gbdt}/ layout.
+SCRIPTS_ROOT = Path(__file__).resolve().parent.parent
 
 MIND_STAGES: list[tuple[str, list[str]]] = [
-    ("download_mind_small.py", []),
-    ("clean_mind.py", []),
-    ("split_mind.py", []),
-    ("build_feature_store.py", []),
+    ("data/download_mind_small.py", []),
+    ("data/clean_mind.py", []),
+    ("pipeline/split_mind.py", []),
+    ("pipeline/build_feature_store.py", []),
 ]
 
 
@@ -47,10 +50,10 @@ def ebnerd_stages(bundle: str) -> list[tuple[str, list[str]]]:
     # 9 payoff of the common-schema design) -- only the acquisition/cleaning
     # stages need to know which EB-NeRD bundle to fetch.
     return [
-        ("download_ebnerd.py", ["--bundle", bundle]),
-        ("clean_ebnerd.py", ["--bundle", bundle]),
-        ("split_mind.py", []),
-        ("build_feature_store.py", []),
+        ("data/download_ebnerd.py", ["--bundle", bundle]),
+        ("data/clean_ebnerd.py", ["--bundle", bundle]),
+        ("pipeline/split_mind.py", []),
+        ("pipeline/build_feature_store.py", []),
     ]
 
 
@@ -82,7 +85,7 @@ def main() -> None:
     for stage_script, extra_args in stages:
         print(f"\n{'=' * 70}\n>>> Running {stage_script}\n{'=' * 70}", flush=True)
         result = subprocess.run(
-            [sys.executable, str(SCRIPTS_DIR / stage_script), "--config", args.config, *extra_args],
+            [sys.executable, str(SCRIPTS_ROOT / stage_script), "--config", args.config, *extra_args],
             check=False,
         )
         if result.returncode != 0:

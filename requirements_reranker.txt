@@ -1,0 +1,12 @@
+# Additional dependency for the Component-2 GBDT re-ranker only.
+# Kept separate from requirements.txt (Component 1's dependency list) so
+# Component 1 remains installable/reproducible without ever needing this.
+#
+# Install with:
+#   pip install -r requirements.txt -r requirements_reranker.txt
+lightgbm==4.5.0
+
+# LGBMRanker is lightgbm's scikit-learn-compatible wrapper API -- requires
+# scikit-learn to be installed (lightgbm does not vendor it).
+scikit-learn==1.9.0
+

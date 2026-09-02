@@ -2,7 +2,7 @@
 
 These tests run against the real downloaded MIND-small files, so they are
 skipped (not failed) if the dataset hasn't been downloaded yet. Run
-scripts/download_mind_small.py first.
+scripts/data/download_mind_small.py first.
 
 Run with: pytest tests/test_mind_loader.py -v
 """
@@ -21,7 +21,7 @@ TRAIN_DIR = CONFIG.raw_dir / "train" / "MINDsmall_train"
 
 pytestmark = pytest.mark.skipif(
     not TRAIN_DIR.exists(),
-    reason="MIND-small not downloaded yet -- run scripts/download_mind_small.py first",
+    reason="MIND-small not downloaded yet -- run scripts/data/download_mind_small.py first",
 )
 
 
