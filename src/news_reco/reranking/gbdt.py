@@ -28,6 +28,7 @@ Feature families (see docs/gbdt_reranker.md for full definitions):
 from __future__ import annotations
 
 import dataclasses
+import sys
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -55,8 +56,31 @@ COMMON_FEATURE_NAMES = [
     "article_training_click_count",
     "max_cosine_similarity_to_any_history_article",
     "mean_cosine_similarity_to_history_articles",
+    # Position bias (Assignment 2 Q1.2): the candidate's own 1-indexed
+    # position in the impression's candidate list AS GIVEN by the raw
+    # dataset -- zero new data required (candidate_ids' own order), and
+    # available for BOTH datasets, not EB-NeRD-only as the Milestone 1
+    # audit first assumed (that mixed this up with within-session click
+    # patterns, a different, harder ask -- see docs/gbdt_reranker.md).
+    # Serving-safe by construction: it's part of the input, not derived
+    # from anything that happens after serving. NOT verified against
+    # either dataset's documentation to reflect true on-screen display
+    # order (vs. an arbitrary logging order) -- used as the best
+    # available proxy, with that caveat stated plainly rather than
+    # asserting certainty this repo hasn't confirmed.
+    "candidate_position_in_impression",
 ]
 TEMPORAL_FEATURE_NAME = "article_age_hours"
+# EB-NeRD only (needs history.parquet's impression_time_fixed/read_time_fixed
+# arrays, which news_reco.data.ebnerd_adapter -- Component 1 -- does not
+# read at all; see load_ebnerd_history_detail and docs/gbdt_reranker.md
+# Design Decision C). Appended to the feature list only when a caller
+# actually supplies history_detail_by_user, exactly like
+# TEMPORAL_FEATURE_NAME's availability_gate condition -- omitted, never
+# fabricated, when the data isn't wired up (MIND, or an EB-NeRD caller
+# that hasn't opted in).
+RECENCY_FEATURE_NAME = "recency_weighted_semantic_similarity_to_history"
+DWELL_FEATURE_NAME = "mean_history_read_time_seconds"
 
 # Feature families, named exactly as in docs/gbdt_reranker.md, used to build
 # the Milestone-7 ablation study. Each ablation below is RETRIEVAL features
@@ -76,11 +100,14 @@ CONTENT_FEATURES = [
     "category_match_with_history",
     "subcategory_match_with_history",
 ]
-BEHAVIORAL_FEATURES = ["history_length", "article_training_click_count"]
+BEHAVIORAL_FEATURES = ["history_length", "article_training_click_count", "candidate_position_in_impression"]
 SEMANTIC_HISTORY_FEATURES = [
     "max_cosine_similarity_to_any_history_article",
     "mean_cosine_similarity_to_history_articles",
 ]
+# EB-NeRD only, mirrors TEMPORAL_FEATURE_NAME's own conditional inclusion --
+# see RECENCY_FEATURE_NAME/DWELL_FEATURE_NAME above.
+RECENCY_DWELL_FEATURES = [RECENCY_FEATURE_NAME, DWELL_FEATURE_NAME]
 
 # retrieval_semantic_history isn't one of the four ablations named in the
 # original brief (A-E) -- added because Milestone 5's feature-importance
@@ -103,6 +130,11 @@ ABLATIONS: dict[str, list[str]] = {
     # "how much of the full model's gain is just freshness" a real,
     # previously-untested question the other four ablations can't answer.
     "retrieval_temporal": RETRIEVAL_FEATURES + [TEMPORAL_FEATURE_NAME],
+    # EB-NeRD only, same reasoning as retrieval_temporal -- isolates the
+    # recency-decay + dwell-time family (Assignment 2 Q1.1/Q1.2) so its
+    # marginal contribution can be measured directly rather than only ever
+    # seen bundled into "full".
+    "retrieval_recency_dwell": RETRIEVAL_FEATURES + RECENCY_DWELL_FEATURES,
 }
 
 
@@ -471,6 +503,154 @@ class ExpandingTrainPopularity:
 
 
 # --------------------------------------------------------------------------
+# Recency-decay + dwell-time features (EB-NeRD only, Assignment 2 Q1.1/Q1.2)
+#
+# Design decision C (Milestone 1 audit): EB-NeRD's raw history.parquet has
+# FOUR parallel arrays -- article_id_fixed, impression_time_fixed,
+# scroll_percentage_fixed, read_time_fixed -- one entry per history article,
+# but news_reco.data.ebnerd_adapter (Component 1) only ever reads
+# article_id_fixed (all it needs for BM25/semantic query construction).
+# impression_time_fixed and read_time_fixed are read here, SEPARATELY, by
+# GBDT-only code -- not by extending Component 1's schema/adapter, which
+# Assignment 2 says to build ON TOP OF, not rewrite. This means
+# history.parquet gets read twice across the two layers (once by
+# FeatureStore via the adapter, once here) -- a small, deliberate
+# duplication, not a bug.
+#
+# Both features are leak-safe for the same reason article_id_fixed already
+# is (Component 1's own check_no_future_click_leakage covers the whole
+# history array, not just the IDs): impression_time_fixed[i] and
+# read_time_fixed[i] describe a PAST click, a fact about something that
+# already happened before the current impression, not a property of the
+# impression being predicted. This is categorically different from
+# behaviors.parquet's read_time/scroll_percentage (Milestone 1 finding),
+# which describe engagement during/after the CURRENT impression and are
+# NOT used here or anywhere in this module.
+# --------------------------------------------------------------------------
+
+
+def load_ebnerd_history_detail(history_path: Path) -> dict[int, list[tuple[str, pd.Timestamp, float]]]:
+    """Per-user list of (article_id, click_time, read_time_seconds), read
+    directly from EB-NeRD's raw history.parquet.
+
+    Every article_id is passed through sys.intern() -- NOT a micro-
+    optimization here, a repeat of an already-paid-for lesson: the same
+    per-user-history read in scripts/gbdt/generate_ebnerd_submission_gbdt.py
+    (build_user_history) interns for exactly this reason, because the
+    official ebnerd_testset has 807,677 users x ~145 articles average --
+    without interning, that's ~117M distinct (rather than shared) short
+    string objects, the same failure MODE (not the same code) as the
+    Milestone 13 whole-machine crash. EB-NeRD-small's ~15-200K users is
+    small enough that this wasn't caught by testing at that scale; fixed
+    here, once, before this function is ever called at official-test scale.
+
+    read_time_fixed can be null (EB-NeRD's own convention for "no read-time
+    recorded for this click") -- kept as NaN rather than coerced to 0.0,
+    since 0.0 would be a fabricated, wrong value (indistinguishable from "the
+    user read this for zero seconds"); mean_history_read_time below drops
+    NaN entries rather than averaging them in as zeros.
+    """
+    history = pd.read_parquet(
+        history_path, columns=["user_id", "article_id_fixed", "impression_time_fixed", "read_time_fixed"]
+    )
+    result: dict[str, list[tuple[str, pd.Timestamp, float]]] = {}
+    for user_id, article_ids, click_times, read_times in zip(
+        history["user_id"],
+        history["article_id_fixed"],
+        history["impression_time_fixed"],
+        history["read_time_fixed"],
+    ):
+        # str(user_id) -- NOT the raw numpy int64 -- to match
+        # news_reco.data.ebnerd_adapter's own convention (its
+        # build_impressions_and_interactions does `.astype(str)` on
+        # user_id when building the common-schema impressions table).
+        # Caught by testing against real data before trusting a smoke
+        # test that only checked "columns exist, nothing crashed": every
+        # lookup by the common schema's (string) user_id against an
+        # int-keyed dict here would silently miss every time, computing
+        # 0.0 everywhere with no error at all -- exactly the failure mode
+        # a shape/crash-only check can't catch.
+        result[str(user_id)] = list(zip((sys.intern(str(a)) for a in article_ids), click_times, read_times))
+    return result
+
+
+def _ages_hours_strictly_before(
+    history_detail: list[tuple[str, pd.Timestamp, float]], impression_time: pd.Timestamp
+) -> list[tuple[str, float, float]]:
+    """Filter history_detail to entries strictly before impression_time, and
+    convert each click_time to its age in hours at impression_time.
+
+    Defensive, not just decorative: Component 1's check_no_future_click_leakage
+    already verifies every history entry predates its impression across the
+    whole dataset (small documented violation-rate tolerance for MIND's
+    observation-window edge effects -- see reports/engineering_log.md), but
+    this function does its own strict filtering rather than trusting that
+    invariant silently, so a violation here becomes "excluded", not "used".
+    """
+    kept = []
+    for article_id, click_time, read_time in history_detail:
+        if pd.isna(click_time) or click_time >= impression_time:
+            continue
+        age_hours = (impression_time - click_time).total_seconds() / 3600.0
+        kept.append((article_id, age_hours, read_time))
+    return kept
+
+
+def batch_recency_weighted_semantic_similarity(
+    candidate_matrix: np.ndarray,
+    history_matrix: np.ndarray | None,
+    history_weights: np.ndarray | None,
+) -> np.ndarray:
+    """Exponential-decay-weighted mean cosine similarity to history, for
+    EVERY candidate in an impression at once -- one (n_candidates,
+    n_history) matrix multiply plus a weighted sum, mirroring
+    batch_semantic_history_similarity's own vectorization (needed for the
+    same reason: EB-NeRD's long average history makes a per-candidate
+    Python loop a real cost at scale).
+
+    history_weights[i] = 0.5 ** (age_hours_i / half_life_hours) -- computed
+    by the caller (build_impression_rows), since it depends on
+    impression_time, which is impression-specific, not history-specific.
+    Weights need not sum to 1; normalized here by their own sum, so the
+    result is a weighted AVERAGE, not a weighted SUM (a candidate similar to
+    5 recent articles shouldn't score 5x higher than one similar to a
+    single recent article).
+
+    Returns 0.0 for every candidate if history is empty or all weights are
+    zero (e.g. every history entry fell outside the strictly-before-impression
+    filter).
+    """
+    n_candidates = len(candidate_matrix)
+    if history_matrix is None or len(history_matrix) == 0 or history_weights is None:
+        return np.zeros(n_candidates)
+    total_weight = float(history_weights.sum())
+    if total_weight <= 0:
+        return np.zeros(n_candidates)
+    similarity_matrix = candidate_matrix @ history_matrix.T  # (n_candidates, n_history)
+    weighted_sum = similarity_matrix @ history_weights  # (n_candidates,)
+    return weighted_sum / total_weight
+
+
+def mean_history_read_time(history_detail_before: list[tuple[str, float, float]]) -> float:
+    """Mean PAST read_time (seconds) across history articles already
+    filtered to strictly-before-impression by _ages_hours_strictly_before.
+
+    A plain (not recency-weighted) mean, deliberately -- this is meant to
+    capture "how engaged is this user, in general", not "how engaged were
+    they recently" (that would double up with the recency-weighted
+    similarity feature's own decay). NaN read_time entries (EB-NeRD's own
+    "not recorded" convention) are dropped, not treated as 0 -- a real
+    zero-second read and a missing measurement are different facts.
+    Returns 0.0 (not NaN) if there's nothing to average, consistent with
+    every other history-derived feature's empty-history convention.
+    """
+    read_times = [read_time for _, _, read_time in history_detail_before if not pd.isna(read_time)]
+    if not read_times:
+        return 0.0
+    return float(np.mean(read_times))
+
+
+# --------------------------------------------------------------------------
 # Retrieval features (thin wrappers -- all real work is Component 1's)
 # --------------------------------------------------------------------------
 
@@ -544,6 +724,8 @@ def build_impression_rows(
     availability_gate: AvailabilityGate | None,
     gate_freshness: bool,
     clicked_by_article: dict[str, int] | None,
+    history_detail: list[tuple[str, pd.Timestamp, float]] | None = None,
+    recency_half_life_hours: float = 24.0,
 ) -> tuple[list[dict], int]:
     """Build one feature row per candidate for a single impression.
 
@@ -565,6 +747,15 @@ def build_impression_rows(
         popularity_lookup: article_id, time -> int. Callers pass a frozen
             dict lookup for val/test rows and ExpandingTrainPopularity for
             train rows (see docs/gbdt_reranker.md, Design Decision A).
+        history_detail: this user's (article_id, click_time, read_time)
+            tuples from load_ebnerd_history_detail, or None to omit
+            RECENCY_FEATURE_NAME/DWELL_FEATURE_NAME entirely (MIND has no
+            such data; an EB-NeRD caller that hasn't wired this up gets the
+            same omit-don't-fabricate treatment as article_age_hours).
+        recency_half_life_hours: the exponential-decay half-life for
+            RECENCY_FEATURE_NAME -- 24h is a plain, disclosed default (one
+            news cycle), not tuned; a caller wanting a different value
+            passes it through explicitly rather than this function guessing.
 
     Returns:
         (rows, n_age_violations) -- rows is a list of plain dicts (one per
@@ -597,6 +788,27 @@ def build_impression_rows(
         history_subcategory_union |= _as_label_set(value)
     history_matrix = np.stack(history_embeddings) if history_embeddings else None
 
+    # Recency/dwell precompute (EB-NeRD only -- see the module section above
+    # this function). Deliberately a SEPARATE filtered set from
+    # history_embeddings above: history_detail comes from a different raw
+    # read (history.parquet's timestamp arrays, not the common-schema
+    # history field), and _ages_hours_strictly_before applies its own
+    # defensive strictly-before-impression_time filter rather than trusting
+    # every entry is already valid.
+    recency_history_matrix = None
+    recency_weights = None
+    history_detail_before: list[tuple[str, float, float]] = []
+    if history_detail is not None:
+        history_detail_before = _ages_hours_strictly_before(history_detail, impression_time)
+        recency_embeddings = [
+            get_article_embedding(article_id) for article_id, _age, _read in history_detail_before
+        ]
+        if recency_embeddings:
+            recency_history_matrix = np.stack(recency_embeddings)
+            recency_weights = np.array(
+                [0.5 ** (age_hours / recency_half_life_hours) for _aid, age_hours, _read in history_detail_before]
+            )
+
     history_length = len(history)
 
     eligible_ids: set[str] | None = None
@@ -619,6 +831,10 @@ def build_impression_rows(
 
     title_overlaps = batch_max_jaccard_overlap(candidate_token_sets, history_token_sets)
     max_sims, mean_sims = batch_semantic_history_similarity(candidate_embeddings, history_matrix)
+    recency_weighted_sims = batch_recency_weighted_semantic_similarity(
+        candidate_embeddings, recency_history_matrix, recency_weights
+    )
+    dwell_mean = mean_history_read_time(history_detail_before) if history_detail is not None else None
 
     rows: list[dict] = []
     n_age_violations = 0
@@ -645,6 +861,9 @@ def build_impression_rows(
             "article_training_click_count": popularity_lookup(article_id, impression_time),
             "max_cosine_similarity_to_any_history_article": float(max_sims[rank_index]),
             "mean_cosine_similarity_to_history_articles": float(mean_sims[rank_index]),
+            # 1-indexed, matching semantic_rank_within_impression/
+            # bm25_rank_within_impression's own convention (rank 1 = first).
+            "candidate_position_in_impression": rank_index + 1,
         }
 
         if availability_gate is not None:
@@ -655,6 +874,10 @@ def build_impression_rows(
             else:
                 row[TEMPORAL_FEATURE_NAME] = np.nan
                 n_age_violations += 1
+
+        if history_detail is not None:
+            row[RECENCY_FEATURE_NAME] = float(recency_weighted_sims[rank_index])
+            row[DWELL_FEATURE_NAME] = dwell_mean
 
         if clicked_by_article is not None:
             row["clicked"] = clicked_by_article.get(article_id, 0)
@@ -682,6 +905,8 @@ def build_feature_table(
     availability_gate: AvailabilityGate | None = None,
     gate_freshness: bool = False,
     clicked_lookup: dict[object, dict[str, int]] | None = None,
+    history_detail_by_user: dict[object, list[tuple[str, pd.Timestamp, float]]] | None = None,
+    recency_half_life_hours: float = 24.0,
 ) -> tuple[pd.DataFrame, int]:
     """Build the full feature table for a set of impressions, one row per
     surviving (impression, candidate) pair, sorted by impression_id so that
@@ -689,10 +914,14 @@ def build_feature_table(
     the same row order as the table itself.
 
     Args:
-        impressions: Must have impression_id, time, history (list[str]).
+        impressions: Must have impression_id, user_id, time, history (list[str]).
         candidates_by_impression: {impression_id: [candidate_article_ids]}.
         clicked_lookup: {impression_id: {article_id: 0/1}}, or None to build
             an unlabeled table (official Codabench test impressions).
+        history_detail_by_user: {user_id: [(article_id, click_time,
+            read_time), ...]} from load_ebnerd_history_detail, or None to
+            omit RECENCY_FEATURE_NAME/DWELL_FEATURE_NAME entirely (see
+            build_impression_rows's history_detail).
 
     Returns:
         (feature_table, total_age_violations) -- see build_impression_rows
@@ -720,6 +949,20 @@ def build_feature_table(
         semantic_query_vector = build_query_embedding(history, get_article_embedding)
 
         clicked_by_article = clicked_lookup.get(impression.impression_id) if clicked_lookup is not None else None
+        # .get(user_id, []) -- NOT .get(user_id) -- is deliberate: when the
+        # caller has opted into these features for the whole table
+        # (history_detail_by_user is not None), every row must get
+        # RECENCY_FEATURE_NAME/DWELL_FEATURE_NAME, even for a user this
+        # particular lookup doesn't cover. An empty list (not None) keeps
+        # build_impression_rows' "history_detail is not None" branch active,
+        # so it still emits both columns -- correctly computed as 0.0 by
+        # batch_recency_weighted_semantic_similarity/mean_history_read_time's
+        # own empty-input handling -- instead of silently omitting the
+        # columns for just this row and breaking the table's fixed column
+        # list downstream.
+        history_detail = (
+            history_detail_by_user.get(impression.user_id, []) if history_detail_by_user is not None else None
+        )
 
         rows, violations = build_impression_rows(
             impression_id=impression.impression_id,
@@ -736,6 +979,8 @@ def build_feature_table(
             availability_gate=availability_gate,
             gate_freshness=gate_freshness,
             clicked_by_article=clicked_by_article,
+            history_detail=history_detail,
+            recency_half_life_hours=recency_half_life_hours,
         )
         all_rows.extend(rows)
         total_violations += violations
@@ -743,6 +988,8 @@ def build_feature_table(
     feature_names = list(COMMON_FEATURE_NAMES)
     if availability_gate is not None:
         feature_names.append(TEMPORAL_FEATURE_NAME)
+    if history_detail_by_user is not None:
+        feature_names += [RECENCY_FEATURE_NAME, DWELL_FEATURE_NAME]
     columns = ["impression_id", "article_id"] + feature_names + (["clicked"] if clicked_lookup is not None else [])
 
     if not all_rows:

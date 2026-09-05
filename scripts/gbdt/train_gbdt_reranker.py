@@ -58,19 +58,54 @@ from news_reco.features.store import FeatureStore  # noqa: E402
 from news_reco.reranking.gbdt import (  # noqa: E402
     ABLATIONS,
     COMMON_FEATURE_NAMES,
+    DWELL_FEATURE_NAME,
+    RECENCY_FEATURE_NAME,
     TEMPORAL_FEATURE_NAME,
     ExpandingTrainPopularity,
     GBDTConfig,
     build_feature_table,
     build_frozen_train_click_counts,
+    load_ebnerd_history_detail,
     load_gbdt_config,
 )
 from news_reco.retrieval.availability import AvailabilityGate  # noqa: E402
 from news_reco.retrieval.lexical.bm25 import DANISH_STOPWORDS, STOPWORDS, BM25Index  # noqa: E402
 from news_reco.retrieval.semantic.embeddings import EmbeddingIndex  # noqa: E402
-from news_reco.utils.config import load_config  # noqa: E402
+from news_reco.utils.config import PipelineConfig, load_config  # noqa: E402
 
 STOPWORDS_BY_LANGUAGE = {"en": STOPWORDS, "da": DANISH_STOPWORDS}
+
+
+def load_ebnerd_history_detail_by_split(dataset_config: PipelineConfig) -> dict[str, dict] | None:
+    """{"train": ..., "val": ..., "test": ...} history-detail dicts (see
+    news_reco.reranking.gbdt.load_ebnerd_history_detail), or None for MIND.
+
+    Mirrors scripts/data/clean_ebnerd.py's own raw-file mapping exactly
+    (verified by reading that script, not assumed): this project's train
+    split is entirely built from EB-NeRD's raw "train" behaviors+history
+    pair, and BOTH this project's val and test splits are carved (by
+    val_start/test_start date cutoffs) from EB-NeRD's raw "validation"
+    pair -- there's no separate raw "test" history file for the small/demo
+    bundles, so val and test correctly share the SAME underlying history
+    detail here, exactly as they already implicitly share the same
+    article-ID-only history via the common schema. Using the wrong raw
+    file (e.g. train's history for a val/test impression) would attach
+    timestamps belonging to a DIFFERENT snapshot of that user's history
+    than the article-ID list already in play -- silently wrong, not just
+    incomplete -- so this mapping is load-bearing, not a convenience.
+
+    The bundle name ("small"/"demo") isn't stored in PipelineConfig --
+    inferred from dataset_name the same way scripts/pipeline/build_pipeline.py
+    already does (`dataset_name.removeprefix("ebnerd_")`), not a new
+    convention invented here.
+    """
+    if not dataset_config.dataset_name.startswith("ebnerd_"):
+        return None
+    bundle = dataset_config.dataset_name.removeprefix("ebnerd_")
+    bundle_dir = dataset_config.raw_dir / bundle
+    train_detail = load_ebnerd_history_detail(bundle_dir / "train" / "history.parquet")
+    val_detail = load_ebnerd_history_detail(bundle_dir / "validation" / "history.parquet")
+    return {"train": train_detail, "val": val_detail, "test": val_detail}
 
 
 def warm_impressions(store: FeatureStore, split: str) -> pd.DataFrame:
@@ -88,6 +123,7 @@ def build_split_dataset(
     availability_gate: AvailabilityGate | None,
     popularity_lookup,
     split: str,
+    history_detail_by_user: dict | None = None,
 ) -> tuple[pd.DataFrame, int]:
     """Assemble one split's feature table, end to end, from FeatureStore."""
     impressions = warm_impressions(store, split)
@@ -111,6 +147,7 @@ def build_split_dataset(
         availability_gate=availability_gate,
         gate_freshness=gbdt_config.gate_freshness,
         clicked_lookup=clicked_lookup,
+        history_detail_by_user=history_detail_by_user,
     )
     return table, n_violations
 
@@ -124,6 +161,7 @@ def get_or_build_split_dataset(
     popularity_lookup,
     split: str,
     rebuild: bool,
+    history_detail_by_user: dict | None = None,
 ) -> tuple[pd.DataFrame, int]:
     """Load a cached split_features.parquet if present, else build + save it."""
     out_path = gbdt_config.feature_table_dir / f"{split}_features.parquet"
@@ -133,7 +171,8 @@ def get_or_build_split_dataset(
 
     start = time.time()
     table, n_violations = build_split_dataset(
-        gbdt_config, store, bm25_index, semantic_index, availability_gate, popularity_lookup, split
+        gbdt_config, store, bm25_index, semantic_index, availability_gate, popularity_lookup, split,
+        history_detail_by_user=history_detail_by_user,
     )
     elapsed = time.time() - start
     verify_impression_groups(table, split)
@@ -223,12 +262,19 @@ def main() -> None:
         "test": frozen_popularity_lookup,
     }
 
+    print("Loading EB-NeRD history detail (recency-decay + dwell-time features) ..." if
+          dataset_config.dataset_name.startswith("ebnerd_") else
+          "Not EB-NeRD -- recency-decay + dwell-time features are omitted, not fabricated.")
+    history_detail_by_split = load_ebnerd_history_detail_by_split(dataset_config)
+
     # full_feature_names is what build_feature_table actually produces (used
     # to validate the cached table below); model_feature_names is what gets
     # fed to LGBMRanker -- identical for --ablation full, a fixed subset
     # otherwise. Restricting columns, not rebuilding features, is what makes
     # an ablation run cheap: the cached parquet already has every feature.
     full_feature_names = list(COMMON_FEATURE_NAMES) + ([TEMPORAL_FEATURE_NAME] if availability_gate is not None else [])
+    if history_detail_by_split is not None:
+        full_feature_names += [RECENCY_FEATURE_NAME, DWELL_FEATURE_NAME]
     model_feature_names = full_feature_names if args.ablation == "full" else ABLATIONS[args.ablation]
     print(f"\nAblation: {args.ablation}")
     print(f"Full feature set ({len(full_feature_names)}): {full_feature_names}")
@@ -248,6 +294,7 @@ def main() -> None:
             popularity_by_split[split],
             split,
             rebuild=args.rebuild_features,
+            history_detail_by_user=history_detail_by_split[split] if history_detail_by_split is not None else None,
         )
         if availability_gate is not None and n_violations >= 0:
             n_rows_with_age = table[TEMPORAL_FEATURE_NAME].notna().sum()
