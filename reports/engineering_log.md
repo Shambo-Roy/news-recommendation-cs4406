@@ -2325,3 +2325,111 @@ decay, dwell-time on EB-NeRD); every reported number above is from this
 session's own real runs against real data, no numbers carried over
 unchanged except where explicitly noted as an exact-match reproducibility
 check (`retrieval_temporal`).
+
+## Within-session click patterns (Q1.2's third, deferred behavioral feature) -- 2026-09-05
+
+**Dataset audit before any design decision** (spawned a dedicated
+read-only investigation rather than assuming from memory of these
+datasets in general): MIND's `behaviors.tsv` has only `impression_id,
+user_id, time, history, impressions` (`news_reco.data.mind_loader`) --
+no session concept at all. Empirically checked MIND's own inter-
+impression time gaps for repeat users (200-user sample, n=4,670
+consecutive pairs): median 117 min, 10th percentile 9.6 min -- no clean
+cutoff that would justify inventing a synthetic session via a time-gap
+heuristic. That would be fabricating a signal the data doesn't contain,
+which this project's own stated discipline forbids -- **within-session
+click patterns are EB-NeRD-only**, same as `article_age_hours`/recency/
+dwell, and for the same kind of reason.
+
+EB-NeRD's raw `behaviors.parquet` (not `history.parquet`, which lacks
+this) has a genuine `session_id` (uint32) column, strictly per-user (0 of
+120,587 train sessions span >1 user), tightly time-clustered (e.g. one
+session's impressions 20 seconds to a few minutes apart). Mean 1.93
+impressions/session, median 1, max 24 (train split).
+
+**Design decided and implemented**: two per-impression features (constant
+across all candidate rows of one impression, same convention as
+`history_length`/`mean_history_read_time_seconds`), computed from ONLY
+prior impressions in the SAME `session_id`, strictly before the current
+impression's `impression_time`:
+- `session_impression_index` -- count of earlier impressions in this session.
+- `session_clicks_so_far` -- total articles clicked across those earlier
+  impressions.
+
+Explicitly deferred to a later iteration (not implemented now, per the
+user's own choice when asked): a third feature,
+`session_click_rate_so_far` -- redundant with the two counts for short
+sessions, and the ablation study can answer whether it's worth adding
+before spending design effort on it.
+
+**Leak-safety**: never reads `read_time`/`scroll_percentage` on the
+CURRENT impression's own row (already flagged elsewhere in this log as
+likely-leakage) or `next_read_time`/`next_scroll_percentage`
+(unambiguous future leakage, never used anywhere in this project) --
+`load_ebnerd_session_detail` only reads `user_id`, `impression_time`,
+`session_id`, `article_ids_clicked`. Strictly-before filtering reuses the
+exact tie-exclusion convention already established by
+`_ages_hours_strictly_before` (ties -- identical `impression_time` --
+excluded from the "before" count, not treated as ambiguous or as leakage).
+
+**A real design wrinkle, checked against real data rather than assumed
+away**: mapping a common-schema impression back to its raw `session_id`
+needs a join key, since `news_reco.data.ebnerd_adapter.
+build_impressions_and_interactions` mints a FRESH `impression_id` per row
+and does not preserve or carry `session_id` into the common schema at
+all. Used `(user_id, impression_time)` instead -- `time` is copied
+unchanged from `behaviors_df["impression_time"]`, so an exact match
+against the same raw file's own rows should always succeed for a
+correctly-wired caller. Checked for ambiguity before trusting this:
+EB-NeRD-small train's 232,887-row `behaviors.parquet` has exactly 6
+duplicate `(user_id, impression_time)` pairs (11 rows, ~0.005%) -- in
+every one of the 5 duplicate groups, the tied rows share the SAME
+`session_id`, so the exact-time lookup can never resolve to the wrong
+session for this data. Also verified `article_ids_clicked` is never null
+(every logged EB-NeRD impression has >=1 click, unlike MIND's explicit
+0/1-labeled format), so `len(article_ids_clicked)` needs no None-guard.
+
+**Implementation**: `load_ebnerd_session_detail` (reads behaviors.parquet,
+str(user_id) keys -- same convention and same reason as
+`load_ebnerd_history_detail`, no `sys.intern()` needed since session_id/
+click-counts are small ints, not strings) and `session_context_strictly_
+before` (two-step: find the current impression's own `session_id` by
+exact-time match, then count/sum same-session entries strictly before
+it) added to `src/news_reco/reranking/gbdt.py`. Threaded through
+`build_impression_rows`/`build_feature_table` with the identical
+`.get(user_id, [])`-default pattern already established for
+`history_detail_by_user` (an empty list correctly yields (0, 0) via the
+same "no exact-time match found" defensive path, not a crash). New
+`retrieval_session` ablation (EB-NeRD only) added alongside
+`retrieval_temporal`/`retrieval_recency_dwell`. `scripts/gbdt/
+train_gbdt_reranker.py` gained a mirroring `load_ebnerd_session_detail_
+by_split` (same train/train, val+test/validation raw-file mapping,
+verified against `clean_ebnerd.py` already, not re-derived) and wiring
+through `build_split_dataset`/`get_or_build_split_dataset`/`main()`.
+
+9 new tests (174 total, up from 165): `load_ebnerd_session_detail`'s
+string-key contract (mirroring the exact test that would have caught the
+`history_detail` user_id bug, applied here from the start rather than
+after a real bug surfaced), `session_context_strictly_before` hand-
+computed (including tie-exclusion and the no-match defensive default),
+`build_impression_rows`/`build_feature_table` end-to-end with the same
+missing-user-gets-zero-not-crash case written with STRING user_ids from
+the start. All 174 tests pass.
+
+**Smoke-tested against real data before considering this ready for a
+full retrain**: `load_ebnerd_session_detail` loaded 15,143 EB-NeRD-small
+train users in 0.3s; spot-checked a few real multi-impression sessions by
+hand (e.g. user 139836's session 755: index/clicks-before increment
+0,0 -> 1,1 -> 2,2 -> 3,3 across four same-session impressions, then reset
+to 0,0 at the next session -- exactly the intended semantics). Full-scale
+coverage check across all 232,887 train impressions: **48.22% have
+`session_impression_index` > 0** -- a much stronger coverage rate than
+`retrieval_recency_dwell`'s near-universal-but-weak signal, because
+sessions with >=2 impressions are common even though the median session
+has only 1.
+
+**Not yet done**: the actual retrain/re-evaluation (train+val+test
+feature-table rebuild, full model retrain, `retrieval_session` ablation)
+-- holding for explicit confirmation before spending the ~1-2 hour
+rebuild cost, consistent with how every previous expensive run in this
+project was gated on an explicit go-ahead.

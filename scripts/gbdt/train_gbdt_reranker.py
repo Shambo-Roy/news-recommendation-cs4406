@@ -60,12 +60,15 @@ from news_reco.reranking.gbdt import (  # noqa: E402
     COMMON_FEATURE_NAMES,
     DWELL_FEATURE_NAME,
     RECENCY_FEATURE_NAME,
+    SESSION_CLICKS_SO_FAR_FEATURE_NAME,
+    SESSION_IMPRESSION_INDEX_FEATURE_NAME,
     TEMPORAL_FEATURE_NAME,
     ExpandingTrainPopularity,
     GBDTConfig,
     build_feature_table,
     build_frozen_train_click_counts,
     load_ebnerd_history_detail,
+    load_ebnerd_session_detail,
     load_gbdt_config,
 )
 from news_reco.retrieval.availability import AvailabilityGate  # noqa: E402
@@ -108,6 +111,23 @@ def load_ebnerd_history_detail_by_split(dataset_config: PipelineConfig) -> dict[
     return {"train": train_detail, "val": val_detail, "test": val_detail}
 
 
+def load_ebnerd_session_detail_by_split(dataset_config: PipelineConfig) -> dict[str, dict] | None:
+    """{"train": ..., "val": ..., "test": ...} session-detail dicts (see
+    news_reco.reranking.gbdt.load_ebnerd_session_detail), or None for MIND.
+
+    Same raw-file-to-split mapping as load_ebnerd_history_detail_by_split,
+    and for the same reason -- but reads behaviors.parquet, not
+    history.parquet, since session_id only exists in the former.
+    """
+    if not dataset_config.dataset_name.startswith("ebnerd_"):
+        return None
+    bundle = dataset_config.dataset_name.removeprefix("ebnerd_")
+    bundle_dir = dataset_config.raw_dir / bundle
+    train_detail = load_ebnerd_session_detail(bundle_dir / "train" / "behaviors.parquet")
+    val_detail = load_ebnerd_session_detail(bundle_dir / "validation" / "behaviors.parquet")
+    return {"train": train_detail, "val": val_detail, "test": val_detail}
+
+
 def warm_impressions(store: FeatureStore, split: str) -> pd.DataFrame:
     """Impressions for `split` with non-empty history only -- see this
     file's module docstring for why cold-start impressions are excluded."""
@@ -124,6 +144,7 @@ def build_split_dataset(
     popularity_lookup,
     split: str,
     history_detail_by_user: dict | None = None,
+    session_detail_by_user: dict | None = None,
 ) -> tuple[pd.DataFrame, int]:
     """Assemble one split's feature table, end to end, from FeatureStore."""
     impressions = warm_impressions(store, split)
@@ -148,6 +169,7 @@ def build_split_dataset(
         gate_freshness=gbdt_config.gate_freshness,
         clicked_lookup=clicked_lookup,
         history_detail_by_user=history_detail_by_user,
+        session_detail_by_user=session_detail_by_user,
     )
     return table, n_violations
 
@@ -162,6 +184,7 @@ def get_or_build_split_dataset(
     split: str,
     rebuild: bool,
     history_detail_by_user: dict | None = None,
+    session_detail_by_user: dict | None = None,
 ) -> tuple[pd.DataFrame, int]:
     """Load a cached split_features.parquet if present, else build + save it."""
     out_path = gbdt_config.feature_table_dir / f"{split}_features.parquet"
@@ -173,6 +196,7 @@ def get_or_build_split_dataset(
     table, n_violations = build_split_dataset(
         gbdt_config, store, bm25_index, semantic_index, availability_gate, popularity_lookup, split,
         history_detail_by_user=history_detail_by_user,
+        session_detail_by_user=session_detail_by_user,
     )
     elapsed = time.time() - start
     verify_impression_groups(table, split)
@@ -267,6 +291,11 @@ def main() -> None:
           "Not EB-NeRD -- recency-decay + dwell-time features are omitted, not fabricated.")
     history_detail_by_split = load_ebnerd_history_detail_by_split(dataset_config)
 
+    print("Loading EB-NeRD session detail (within-session click-pattern features) ..." if
+          dataset_config.dataset_name.startswith("ebnerd_") else
+          "Not EB-NeRD -- within-session click-pattern features are omitted, not fabricated.")
+    session_detail_by_split = load_ebnerd_session_detail_by_split(dataset_config)
+
     # full_feature_names is what build_feature_table actually produces (used
     # to validate the cached table below); model_feature_names is what gets
     # fed to LGBMRanker -- identical for --ablation full, a fixed subset
@@ -275,6 +304,8 @@ def main() -> None:
     full_feature_names = list(COMMON_FEATURE_NAMES) + ([TEMPORAL_FEATURE_NAME] if availability_gate is not None else [])
     if history_detail_by_split is not None:
         full_feature_names += [RECENCY_FEATURE_NAME, DWELL_FEATURE_NAME]
+    if session_detail_by_split is not None:
+        full_feature_names += [SESSION_IMPRESSION_INDEX_FEATURE_NAME, SESSION_CLICKS_SO_FAR_FEATURE_NAME]
     model_feature_names = full_feature_names if args.ablation == "full" else ABLATIONS[args.ablation]
     print(f"\nAblation: {args.ablation}")
     print(f"Full feature set ({len(full_feature_names)}): {full_feature_names}")
@@ -295,6 +326,7 @@ def main() -> None:
             split,
             rebuild=args.rebuild_features,
             history_detail_by_user=history_detail_by_split[split] if history_detail_by_split is not None else None,
+            session_detail_by_user=session_detail_by_split[split] if session_detail_by_split is not None else None,
         )
         if availability_gate is not None and n_violations >= 0:
             n_rows_with_age = table[TEMPORAL_FEATURE_NAME].notna().sum()

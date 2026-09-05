@@ -82,6 +82,23 @@ TEMPORAL_FEATURE_NAME = "article_age_hours"
 RECENCY_FEATURE_NAME = "recency_weighted_semantic_similarity_to_history"
 DWELL_FEATURE_NAME = "mean_history_read_time_seconds"
 
+# EB-NeRD only -- needs raw behaviors.parquet's session_id column, which
+# news_reco.data.ebnerd_adapter (Component 1) does not read or preserve in
+# the common schema at all (the common-schema impression_id is re-minted
+# per row -- see build_impressions_and_interactions -- so it cannot be
+# joined back to the raw session_id either). MIND has no session concept
+# whatsoever (its behaviors.tsv has only impression_id/user_id/time/
+# history/impressions -- confirmed by reading news_reco.data.mind_loader,
+# not assumed), and an empirical check of MIND's own inter-impression time
+# gaps for repeat users found no clean cutoff (median 117 min, 10th
+# percentile 9.6 min) that would justify inventing a synthetic session via
+# a time-gap heuristic -- that would be fabricating a signal the data
+# doesn't contain, which this project's own stated discipline forbids.
+# See load_ebnerd_session_detail and reports/engineering_log.md's
+# "within-session click patterns" design entry.
+SESSION_IMPRESSION_INDEX_FEATURE_NAME = "session_impression_index"
+SESSION_CLICKS_SO_FAR_FEATURE_NAME = "session_clicks_so_far"
+
 # Feature families, named exactly as in docs/gbdt_reranker.md, used to build
 # the Milestone-7 ablation study. Each ablation below is RETRIEVAL features
 # plus exactly one other family -- an isolated (not cumulative) addition, so
@@ -108,6 +125,9 @@ SEMANTIC_HISTORY_FEATURES = [
 # EB-NeRD only, mirrors TEMPORAL_FEATURE_NAME's own conditional inclusion --
 # see RECENCY_FEATURE_NAME/DWELL_FEATURE_NAME above.
 RECENCY_DWELL_FEATURES = [RECENCY_FEATURE_NAME, DWELL_FEATURE_NAME]
+# EB-NeRD only, same reasoning -- see SESSION_IMPRESSION_INDEX_FEATURE_NAME/
+# SESSION_CLICKS_SO_FAR_FEATURE_NAME above.
+SESSION_FEATURES = [SESSION_IMPRESSION_INDEX_FEATURE_NAME, SESSION_CLICKS_SO_FAR_FEATURE_NAME]
 
 # retrieval_semantic_history isn't one of the four ablations named in the
 # original brief (A-E) -- added because Milestone 5's feature-importance
@@ -135,6 +155,11 @@ ABLATIONS: dict[str, list[str]] = {
     # marginal contribution can be measured directly rather than only ever
     # seen bundled into "full".
     "retrieval_recency_dwell": RETRIEVAL_FEATURES + RECENCY_DWELL_FEATURES,
+    # EB-NeRD only, same reasoning as retrieval_temporal/retrieval_recency_dwell
+    # -- isolates the within-session click-patterns family (Assignment 2
+    # Q1.2's third, hardest behavioral-feature ask) so its marginal
+    # contribution can be measured directly.
+    "retrieval_session": RETRIEVAL_FEATURES + SESSION_FEATURES,
 }
 
 
@@ -650,6 +675,88 @@ def mean_history_read_time(history_detail_before: list[tuple[str, float, float]]
     return float(np.mean(read_times))
 
 
+def load_ebnerd_session_detail(behaviors_path: Path) -> dict[str, list[tuple[pd.Timestamp, int, int]]]:
+    """Per-user list of (impression_time, session_id, num_clicked), read
+    directly from EB-NeRD's raw behaviors.parquet -- the only file that
+    carries session_id at all (history.parquet does not).
+
+    Every one of this user's impressions in the split is kept (not just
+    ones with multiple-impression sessions), because session_context_
+    strictly_before needs the CURRENT impression's own row too, to look up
+    which session_id it belongs to via an exact impression_time match --
+    see that function's docstring for why this is safe.
+
+    str(user_id), not the raw parquet int/uint -- same convention, and same
+    reason, as load_ebnerd_history_detail: news_reco.data.ebnerd_adapter's
+    common-schema user_id is a string. No sys.intern() here (unlike
+    load_ebnerd_history_detail's article ids): session_id and num_clicked
+    are small ints, not strings, so there is nothing to deduplicate.
+
+    Verified against real data before relying on this design: EB-NeRD-small
+    train's behaviors.parquet has 232,887 rows and exactly 6 (user_id,
+    impression_time) duplicate pairs (11 rows total, ~0.005%) -- in every
+    one of those 5 duplicate groups, the tied rows share the SAME
+    session_id, so an exact-time match can never resolve to the wrong
+    session. article_ids_clicked is never null (every logged impression has
+    at least one click, EB-NeRD's own log format -- unlike MIND's explicit
+    0/1-labeled candidate lists), so num_clicked = len(...) needs no
+    None-guard.
+    """
+    behaviors = pd.read_parquet(
+        behaviors_path, columns=["user_id", "impression_time", "session_id", "article_ids_clicked"]
+    )
+    result: dict[str, list[tuple[pd.Timestamp, int, int]]] = {}
+    for user_id, impression_time, session_id, clicked in zip(
+        behaviors["user_id"], behaviors["impression_time"], behaviors["session_id"], behaviors["article_ids_clicked"]
+    ):
+        result.setdefault(str(user_id), []).append((impression_time, int(session_id), len(clicked)))
+    return result
+
+
+def session_context_strictly_before(
+    user_sessions: list[tuple[pd.Timestamp, int, int]], impression_time: pd.Timestamp
+) -> tuple[int, int]:
+    """How many of this user's OTHER impressions belong to the SAME session
+    as the one at `impression_time`, and occurred strictly before it, plus
+    how many articles were clicked across those earlier impressions.
+
+    Two-step lookup: (1) find impression_time's own session_id by an exact
+    match against this user's own rows (both come from the same raw
+    behaviors.parquet read, via the same impression_time value copied
+    unchanged into the common schema -- see
+    news_reco.data.ebnerd_adapter.build_impressions_and_interactions), then
+    (2) count/sum entries with that same session_id whose impression_time
+    is strictly less than the current one. Ties (identical impression_time)
+    are excluded from the count, matching _ages_hours_strictly_before's
+    convention -- confirmed empirically safe for step (1) in
+    load_ebnerd_session_detail's docstring, and for step (2) a tie only
+    means two impressions in the same session at the same recorded instant
+    are treated as simultaneous rather than one preceding the other, not a
+    leak of the current impression's own outcome.
+
+    Returns (0, 0) if no exact-time match is found at all -- defensive, not
+    expected to trigger for a correctly-wired caller (the current
+    impression's own row must be present in user_sessions, since both come
+    from the same raw file), but a safe, disclosed default rather than a
+    crash if a caller ever mismatches split/user.
+    """
+    current_session_id: int | None = None
+    for time_, session_id, _num_clicked in user_sessions:
+        if time_ == impression_time:
+            current_session_id = session_id
+            break
+    if current_session_id is None:
+        return 0, 0
+
+    impressions_before = 0
+    clicks_before = 0
+    for time_, session_id, num_clicked in user_sessions:
+        if session_id == current_session_id and time_ < impression_time:
+            impressions_before += 1
+            clicks_before += num_clicked
+    return impressions_before, clicks_before
+
+
 # --------------------------------------------------------------------------
 # Retrieval features (thin wrappers -- all real work is Component 1's)
 # --------------------------------------------------------------------------
@@ -726,6 +833,7 @@ def build_impression_rows(
     clicked_by_article: dict[str, int] | None,
     history_detail: list[tuple[str, pd.Timestamp, float]] | None = None,
     recency_half_life_hours: float = 24.0,
+    session_detail: list[tuple[pd.Timestamp, int, int]] | None = None,
 ) -> tuple[list[dict], int]:
     """Build one feature row per candidate for a single impression.
 
@@ -756,6 +864,11 @@ def build_impression_rows(
             RECENCY_FEATURE_NAME -- 24h is a plain, disclosed default (one
             news cycle), not tuned; a caller wanting a different value
             passes it through explicitly rather than this function guessing.
+        session_detail: this user's (impression_time, session_id,
+            num_clicked) tuples from load_ebnerd_session_detail, or None to
+            omit SESSION_IMPRESSION_INDEX_FEATURE_NAME/
+            SESSION_CLICKS_SO_FAR_FEATURE_NAME entirely -- same
+            omit-don't-fabricate treatment as history_detail/article_age_hours.
 
     Returns:
         (rows, n_age_violations) -- rows is a list of plain dicts (one per
@@ -836,6 +949,17 @@ def build_impression_rows(
     )
     dwell_mean = mean_history_read_time(history_detail_before) if history_detail is not None else None
 
+    # Session context (Assignment 2 Q1.2's within-session click patterns),
+    # computed ONCE per impression like dwell_mean above -- it describes the
+    # user's session so far, not anything candidate-specific, so every
+    # candidate row for this impression gets the same value.
+    session_impression_index = None
+    session_clicks_so_far = None
+    if session_detail is not None:
+        session_impression_index, session_clicks_so_far = session_context_strictly_before(
+            session_detail, impression_time
+        )
+
     rows: list[dict] = []
     n_age_violations = 0
 
@@ -879,6 +1003,10 @@ def build_impression_rows(
             row[RECENCY_FEATURE_NAME] = float(recency_weighted_sims[rank_index])
             row[DWELL_FEATURE_NAME] = dwell_mean
 
+        if session_detail is not None:
+            row[SESSION_IMPRESSION_INDEX_FEATURE_NAME] = session_impression_index
+            row[SESSION_CLICKS_SO_FAR_FEATURE_NAME] = session_clicks_so_far
+
         if clicked_by_article is not None:
             row["clicked"] = clicked_by_article.get(article_id, 0)
 
@@ -907,6 +1035,7 @@ def build_feature_table(
     clicked_lookup: dict[object, dict[str, int]] | None = None,
     history_detail_by_user: dict[object, list[tuple[str, pd.Timestamp, float]]] | None = None,
     recency_half_life_hours: float = 24.0,
+    session_detail_by_user: dict[object, list[tuple[pd.Timestamp, int, int]]] | None = None,
 ) -> tuple[pd.DataFrame, int]:
     """Build the full feature table for a set of impressions, one row per
     surviving (impression, candidate) pair, sorted by impression_id so that
@@ -922,6 +1051,11 @@ def build_feature_table(
             read_time), ...]} from load_ebnerd_history_detail, or None to
             omit RECENCY_FEATURE_NAME/DWELL_FEATURE_NAME entirely (see
             build_impression_rows's history_detail).
+        session_detail_by_user: {user_id: [(impression_time, session_id,
+            num_clicked), ...]} from load_ebnerd_session_detail, or None to
+            omit SESSION_IMPRESSION_INDEX_FEATURE_NAME/
+            SESSION_CLICKS_SO_FAR_FEATURE_NAME entirely (see
+            build_impression_rows's session_detail).
 
     Returns:
         (feature_table, total_age_violations) -- see build_impression_rows
@@ -963,6 +1097,10 @@ def build_feature_table(
         history_detail = (
             history_detail_by_user.get(impression.user_id, []) if history_detail_by_user is not None else None
         )
+        # Same .get(user_id, []) reasoning as history_detail above.
+        session_detail = (
+            session_detail_by_user.get(impression.user_id, []) if session_detail_by_user is not None else None
+        )
 
         rows, violations = build_impression_rows(
             impression_id=impression.impression_id,
@@ -981,6 +1119,7 @@ def build_feature_table(
             clicked_by_article=clicked_by_article,
             history_detail=history_detail,
             recency_half_life_hours=recency_half_life_hours,
+            session_detail=session_detail,
         )
         all_rows.extend(rows)
         total_violations += violations
@@ -990,6 +1129,8 @@ def build_feature_table(
         feature_names.append(TEMPORAL_FEATURE_NAME)
     if history_detail_by_user is not None:
         feature_names += [RECENCY_FEATURE_NAME, DWELL_FEATURE_NAME]
+    if session_detail_by_user is not None:
+        feature_names += [SESSION_IMPRESSION_INDEX_FEATURE_NAME, SESSION_CLICKS_SO_FAR_FEATURE_NAME]
     columns = ["impression_id", "article_id"] + feature_names + (["clicked"] if clicked_lookup is not None else [])
 
     if not all_rows:

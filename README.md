@@ -110,7 +110,7 @@ Requires `lightgbm`/`scikit-learn` in addition to `requirements.txt` — see
 .venv\Scripts\python.exe -m pytest tests/ -v
 ```
 
-165 tests, one file per module (118 Component 1 + 47 Component 2). Tests
+174 tests, one file per module (118 Component 1 + 56 Component 2). Tests
 that need a real downloaded dataset are skipped (not failed) if it isn't
 present, so the suite stays runnable on a clean checkout.
 
@@ -182,10 +182,13 @@ metric: `retrieval_recency_dwell` shows no measurable ranking
 improvement in isolation, and the full 15-feature EB-NeRD model still
 underperforms the single-feature `retrieval_temporal` ablation (now
 confirmed reproducible across two independent runs) — an unresolved
-feature-interference limitation, not swept under the rug. Remaining
-work: within-session click patterns (the harder of the three
-behavioral-feature asks, deferred — see the engineering log) and the
-design-note PDF.
+feature-interference limitation, not swept under the rug. Within-session
+click patterns (the harder of the three behavioral-feature asks,
+EB-NeRD-only — MIND has no session concept at all) are now implemented
+(`session_impression_index`, `session_clicks_so_far`) and smoke-tested
+against real data (48% of impressions have real session context), but
+not yet retrained/evaluated — see the engineering log. Remaining work:
+that retrain, and the design-note PDF.
 
 | Extra Component-2 tooling | Script |
 |---|---|
