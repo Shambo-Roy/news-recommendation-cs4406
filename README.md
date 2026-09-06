@@ -110,7 +110,7 @@ Requires `lightgbm`/`scikit-learn` in addition to `requirements.txt` — see
 .venv\Scripts\python.exe -m pytest tests/ -v
 ```
 
-156 tests, one file per module (118 Component 1 + 38 Component 2). Tests
+174 tests, one file per module (118 Component 1 + 56 Component 2). Tests
 that need a real downloaded dataset are skipped (not failed) if it isn't
 present, so the suite stays runnable on a clean checkout.
 
@@ -167,9 +167,35 @@ Codabench submissions) exists and is described above — see
 the full audit trail and every result. Resolved: NRMS is one of two
 allowed re-ranker choices (GBDT vs. a small neural ranker) — GBDT was
 chosen, so the existing GBDT-vs-A1-semantic-baseline comparison already
-satisfies "reproduce the baseline, then beat it." Remaining work:
-recency-decay/session/dwell features (held pending a design-choice
-confirmation — see Milestone 1), and the design-note PDF.
+satisfies "reproduce the baseline, then beat it." Position-bias
+(`candidate_position_in_impression`, both datasets), recency-decay
+(`recency_weighted_semantic_similarity_to_history`), and dwell-time
+(`mean_history_read_time_seconds`, both EB-NeRD-only) features are
+implemented and both datasets' `full` models retrained on the complete
+feature set — EB-NeRD test AUC 0.6693 vs. semantic baseline 0.5344
+(paired bootstrap +0.1350, significant); MIND test AUC 0.6619 vs. 0.6518
+(+0.0100, significant). The EB-NeRD gated retrain and a full refresh of
+the MIND (4) and EB-NeRD (6) ablation studies against the new feature
+set are also done — see the engineering log for every number, including
+two honest, non-obvious findings worth reading before citing any single
+metric: `retrieval_recency_dwell` shows no measurable ranking
+improvement in isolation, and the full 15-feature EB-NeRD model still
+underperforms the single-feature `retrieval_temporal` ablation (now
+confirmed reproducible across two independent runs) — an unresolved
+feature-interference limitation, not swept under the rug. Within-session
+click patterns (the harder of the three behavioral-feature asks,
+EB-NeRD-only — MIND has no session concept at all) are implemented
+(`session_impression_index`, `session_clicks_so_far`), leak-safe, and
+retrained: adding them resolved the full model's earlier `best_iteration
+=1` anomaly (now 18–19 iterations, a much richer feature-importance
+spread), but test AUC is very slightly lower than the pre-session full
+model (ungated 0.6610 vs. 0.6693; gated 0.6559 vs. 0.6650), and the
+isolated `retrieval_session` ablation shows no measurable improvement on
+its own (same honest null result as `retrieval_recency_dwell`) — see the
+engineering log for the full, unresolved feature-interference discussion.
+All three of Q1.2's behavioral-feature asks (position, recency/dwell,
+within-session) are now implemented and evaluated. Remaining work: the
+design-note PDF.
 
 | Extra Component-2 tooling | Script |
 |---|---|

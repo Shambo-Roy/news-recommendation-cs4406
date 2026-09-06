@@ -21,19 +21,29 @@ import pytest
 from news_reco.reranking.gbdt import (
     ArticleLookup,
     COMMON_FEATURE_NAMES,
+    DWELL_FEATURE_NAME,
+    RECENCY_FEATURE_NAME,
+    SESSION_CLICKS_SO_FAR_FEATURE_NAME,
+    SESSION_IMPRESSION_INDEX_FEATURE_NAME,
     TEMPORAL_FEATURE_NAME,
     ExpandingTrainPopularity,
+    _ages_hours_strictly_before,
     batch_max_jaccard_overlap,
+    batch_recency_weighted_semantic_similarity,
     batch_semantic_history_similarity,
     build_feature_table,
     build_frozen_train_click_counts,
     build_impression_rows,
     label_match_with_history,
     label_match_with_history_union,
+    load_ebnerd_history_detail,
+    load_ebnerd_session_detail,
     max_jaccard_overlap,
+    mean_history_read_time,
     retrieval_rank_features,
     semantic_history_similarity,
     semantic_history_similarity_matrix,
+    session_context_strictly_before,
     title_token_overlap_with_history,
 )
 from news_reco.retrieval.availability import AvailabilityGate
@@ -276,6 +286,167 @@ def test_expanding_train_popularity_unknown_article_is_zero():
 
 
 # --------------------------------------------------------------------------
+# Recency-decay + dwell-time features (EB-NeRD only, Assignment 2 Q1.1/Q1.2)
+# --------------------------------------------------------------------------
+
+
+def test_load_ebnerd_history_detail_reads_raw_parquet_arrays(tmp_path):
+    history_df = pd.DataFrame(
+        {
+            "user_id": [1, 2],
+            "article_id_fixed": [np.array([10, 11]), np.array([20])],
+            "impression_time_fixed": [
+                np.array(pd.to_datetime(["2023-01-01 10:00", "2023-01-02 10:00"])),
+                np.array(pd.to_datetime(["2023-01-01 08:00"])),
+            ],
+            "read_time_fixed": [np.array([12.5, np.nan]), np.array([30.0])],
+        }
+    )
+    path = tmp_path / "history.parquet"
+    history_df.to_parquet(path)
+
+    detail = load_ebnerd_history_detail(path)
+
+    # STRING keys, not the raw int64 user_id -- this is the actual bug this
+    # test exists to catch. It slipped through once already: the original
+    # version of this test compared detail.keys() against int literals
+    # ({1, 2}), which a Python `==` happily treats as passing regardless of
+    # whether the keys are int 1 or str "1" is NOT true (1 == "1" is False)
+    # -- so that version WOULD have failed... except every key in this
+    # fixture happens to be a single digit, and the bug was only found by
+    # testing against real EB-NeRD data, where
+    # news_reco.data.ebnerd_adapter's OWN common-schema impressions table
+    # stores user_id as `str` (`.astype(str)`), while this function
+    # originally left it as the raw parquet int -- every
+    # history_detail_by_user.get(impression.user_id) lookup silently missed,
+    # computing 0.0 everywhere with no crash. Asserting str keys explicitly
+    # here, against the exact type real code will look them up with, is
+    # what actually would have caught it.
+    assert set(detail.keys()) == {"1", "2"}
+    assert all(isinstance(k, str) for k in detail.keys())
+    assert len(detail["1"]) == 2
+    # article_id cast to str, NaN read_time preserved as NaN, not coerced to 0.0
+    assert detail["1"][0] == ("10", pd.Timestamp("2023-01-01 10:00"), 12.5)
+    assert detail["1"][1][0] == "11" and detail["1"][1][1] == pd.Timestamp("2023-01-02 10:00")
+    assert np.isnan(detail["1"][1][2])
+    assert detail["2"] == [("20", pd.Timestamp("2023-01-01 08:00"), 30.0)]
+
+
+def test_ages_hours_strictly_before_excludes_ties_and_future_and_nan():
+    impression_time = pd.Timestamp("2023-01-02 12:00")
+    history_detail = [
+        ("A", pd.Timestamp("2023-01-01 12:00"), 10.0),  # exactly 24h before -> kept, age=24.0
+        ("B", pd.Timestamp("2023-01-02 12:00"), 5.0),  # exactly AT impression_time -> excluded (tie)
+        ("C", pd.Timestamp("2023-01-03 12:00"), 7.0),  # AFTER impression_time -> excluded
+        ("D", pd.NaT, 1.0),  # NaT click_time -> excluded
+    ]
+    kept = _ages_hours_strictly_before(history_detail, impression_time)
+    assert len(kept) == 1
+    article_id, age_hours, read_time = kept[0]
+    assert article_id == "A"
+    assert age_hours == pytest.approx(24.0)
+    assert read_time == 10.0
+
+
+def test_batch_recency_weighted_semantic_similarity_hand_computed():
+    # Two candidates, two history articles with different ages -> different
+    # decay weights at half_life=24h: weight = 0.5**(age/24).
+    candidate_matrix = np.array([[1.0, 0.0], [0.0, 1.0]])  # candidate 0 matches history 0; candidate 1 matches history 1
+    history_matrix = np.array([[1.0, 0.0], [0.0, 1.0]])  # history 0 (age=0h, weight=1.0), history 1 (age=24h, weight=0.5)
+    history_weights = np.array([1.0, 0.5])
+
+    result = batch_recency_weighted_semantic_similarity(candidate_matrix, history_matrix, history_weights)
+
+    # candidate 0: sims=[1.0, 0.0] -> weighted_sum = 1.0*1.0 + 0.0*0.5 = 1.0 -> /1.5 = 0.6667
+    # candidate 1: sims=[0.0, 1.0] -> weighted_sum = 0.0*1.0 + 1.0*0.5 = 0.5 -> /1.5 = 0.3333
+    assert result[0] == pytest.approx(1.0 / 1.5)
+    assert result[1] == pytest.approx(0.5 / 1.5)
+
+
+def test_batch_recency_weighted_semantic_similarity_empty_history_is_zero():
+    candidate_matrix = np.array([[1.0, 0.0], [0.0, 1.0]])
+    assert list(batch_recency_weighted_semantic_similarity(candidate_matrix, None, None)) == [0.0, 0.0]
+    result = batch_recency_weighted_semantic_similarity(candidate_matrix, np.zeros((0, 2)), np.zeros(0))
+    assert list(result) == [0.0, 0.0]
+
+
+def test_mean_history_read_time_drops_nan_not_zero():
+    # 10.0 and 30.0 average to 20.0; the NaN entry must be DROPPED, not
+    # averaged in as 0.0 (which would give (10+30+0)/3 = 13.33, wrong).
+    history_detail_before = [("A", 5.0, 10.0), ("B", 3.0, np.nan), ("C", 1.0, 30.0)]
+    assert mean_history_read_time(history_detail_before) == pytest.approx(20.0)
+
+
+def test_mean_history_read_time_empty_is_zero_not_nan():
+    assert mean_history_read_time([]) == 0.0
+
+
+def test_load_ebnerd_session_detail_reads_raw_parquet_arrays(tmp_path):
+    behaviors_df = pd.DataFrame(
+        {
+            "user_id": [1, 1, 2],
+            "impression_time": pd.to_datetime(["2023-01-01 10:00", "2023-01-01 10:05", "2023-01-01 09:00"]),
+            "session_id": [100, 100, 200],
+            "article_ids_clicked": [np.array([11]), np.array([12, 13]), np.array([21])],
+        }
+    )
+    path = tmp_path / "behaviors.parquet"
+    behaviors_df.to_parquet(path)
+
+    detail = load_ebnerd_session_detail(path)
+
+    # STRING keys -- same convention, and same reason, as
+    # load_ebnerd_history_detail (news_reco.data.ebnerd_adapter's
+    # common-schema user_id is a str, not the raw parquet int).
+    assert set(detail.keys()) == {"1", "2"}
+    assert all(isinstance(k, str) for k in detail.keys())
+    assert detail["1"] == [
+        (pd.Timestamp("2023-01-01 10:00"), 100, 1),
+        (pd.Timestamp("2023-01-01 10:05"), 100, 2),
+    ]
+    assert detail["2"] == [(pd.Timestamp("2023-01-01 09:00"), 200, 1)]
+
+
+def test_session_context_strictly_before_hand_computed():
+    # Session 100 has three impressions; session 200 (different session,
+    # same user) must never contribute to session 100's counts.
+    user_sessions = [
+        (pd.Timestamp("2023-01-01 10:00"), 100, 1),  # session 100, impression 0, 1 click
+        (pd.Timestamp("2023-01-01 10:05"), 100, 2),  # session 100, impression 1, 2 clicks
+        (pd.Timestamp("2023-01-01 10:10"), 100, 3),  # session 100, impression 2 (the "current" one below)
+        (pd.Timestamp("2023-01-01 09:00"), 200, 5),  # different session entirely -- must be ignored
+    ]
+    index, clicks = session_context_strictly_before(user_sessions, pd.Timestamp("2023-01-01 10:10"))
+    assert index == 2  # two earlier impressions in session 100
+    assert clicks == 1 + 2  # their click counts, NOT session 200's 5
+
+
+def test_session_context_strictly_before_first_impression_in_session_is_zero():
+    user_sessions = [(pd.Timestamp("2023-01-01 10:00"), 100, 1)]
+    index, clicks = session_context_strictly_before(user_sessions, pd.Timestamp("2023-01-01 10:00"))
+    assert (index, clicks) == (0, 0)
+
+
+def test_session_context_strictly_before_ties_excluded():
+    # Two impressions in the SAME session at the EXACT same recorded
+    # instant -- neither counts as "before" the other (matches
+    # _ages_hours_strictly_before's tie-exclusion convention).
+    t = pd.Timestamp("2023-01-01 10:00")
+    user_sessions = [(t, 100, 7), (t, 100, 9)]
+    index, clicks = session_context_strictly_before(user_sessions, t)
+    assert (index, clicks) == (0, 0)
+
+
+def test_session_context_strictly_before_no_match_defaults_to_zero():
+    # Defensive path: the queried impression_time isn't in user_sessions at
+    # all (shouldn't happen for a correctly-wired caller) -- safe default,
+    # not a crash.
+    user_sessions = [(pd.Timestamp("2023-01-01 10:00"), 100, 1)]
+    index, clicks = session_context_strictly_before(user_sessions, pd.Timestamp("2099-01-01"))
+    assert (index, clicks) == (0, 0)
+
+
+# --------------------------------------------------------------------------
 # Integration: build_impression_rows / build_feature_table with a tiny,
 # fully hand-computable catalog + retrieval indexes.
 # --------------------------------------------------------------------------
@@ -382,6 +553,118 @@ def test_build_impression_rows_hand_computed_values(tiny_catalog):
     # clipped to 0), and counted as a violation.
     assert np.isnan(row3["article_age_hours"])
     assert n_violations == 1
+
+    # Position bias: 1-indexed position in candidate_ids' own order, "1"
+    # first (position 1), "3" second (position 2) -- independent of score.
+    assert row1["candidate_position_in_impression"] == 1
+    assert row3["candidate_position_in_impression"] == 2
+
+    # history_detail was not passed (None) -- recency/dwell columns must be
+    # omitted entirely, not fabricated as 0.0/NaN.
+    assert RECENCY_FEATURE_NAME not in row1
+    assert DWELL_FEATURE_NAME not in row1
+
+
+def test_build_impression_rows_recency_and_dwell_hand_computed(tiny_catalog):
+    """Same fixture as the hand-computed test above, but with history_detail
+    supplied -- verifies the recency-weighted-similarity and dwell-time
+    columns end to end, against values worked out by hand."""
+    impression_time = pd.Timestamp("2023-01-03 00:00")
+    # History article "2" (embedding [0,1]) clicked 24h before the
+    # impression, with a recorded read_time of 15.0 seconds.
+    history_detail = [("2", pd.Timestamp("2023-01-02 00:00"), 15.0)]
+
+    rows, _ = build_impression_rows(
+        impression_id=100,
+        candidate_ids=["1", "3"],
+        history=["2"],
+        impression_time=impression_time,
+        article_lookup=tiny_catalog["article_lookup"],
+        get_article_embedding=tiny_catalog["get_article_embedding"],
+        bm25_index=tiny_catalog["bm25"],
+        semantic_index=tiny_catalog["semantic"],
+        bm25_query="Weather forecast rain",
+        semantic_query_vector=np.array([0.0, 1.0]),
+        popularity_lookup=lambda aid, t: 0,
+        availability_gate=None,  # not needed for this test
+        gate_freshness=False,
+        clicked_by_article=None,
+        history_detail=history_detail,
+        recency_half_life_hours=24.0,
+    )
+    row1, row3 = rows
+
+    # age = 24h = exactly one half-life -> weight = 0.5**(24/24) = 0.5.
+    # Only one history article, so the weighted average IS that one
+    # similarity value regardless of the weight's magnitude (weight cancels
+    # out: weighted_sum / total_weight = (sim*0.5)/0.5 = sim).
+    # "1"=[1,0] . "2"=[0,1] = 0.0; "3"=[0.5,0.5] . [0,1] = 0.5.
+    assert row1[RECENCY_FEATURE_NAME] == pytest.approx(0.0)
+    assert row3[RECENCY_FEATURE_NAME] == pytest.approx(0.5)
+
+    # Dwell time is a per-IMPRESSION value (not per-candidate) -- both rows
+    # get the same mean history read_time, 15.0 (only one entry).
+    assert row1[DWELL_FEATURE_NAME] == pytest.approx(15.0)
+    assert row3[DWELL_FEATURE_NAME] == pytest.approx(15.0)
+
+
+def test_build_impression_rows_session_context_hand_computed(tiny_catalog):
+    """session_detail supplied -- verifies the two within-session columns
+    end to end, and that they're per-IMPRESSION (same on every candidate
+    row), same convention as dwell time above."""
+    impression_time = pd.Timestamp("2023-01-01 10:10")
+    session_detail = [
+        (pd.Timestamp("2023-01-01 10:00"), 100, 1),
+        (pd.Timestamp("2023-01-01 10:05"), 100, 2),
+        (impression_time, 100, 3),  # the "current" impression's own row
+    ]
+
+    rows, _ = build_impression_rows(
+        impression_id=100,
+        candidate_ids=["1", "3"],
+        history=["2"],
+        impression_time=impression_time,
+        article_lookup=tiny_catalog["article_lookup"],
+        get_article_embedding=tiny_catalog["get_article_embedding"],
+        bm25_index=tiny_catalog["bm25"],
+        semantic_index=tiny_catalog["semantic"],
+        bm25_query="Weather forecast rain",
+        semantic_query_vector=np.array([0.0, 1.0]),
+        popularity_lookup=lambda aid, t: 0,
+        availability_gate=None,
+        gate_freshness=False,
+        clicked_by_article=None,
+        session_detail=session_detail,
+    )
+    row1, row3 = rows
+
+    assert row1[SESSION_IMPRESSION_INDEX_FEATURE_NAME] == 2
+    assert row1[SESSION_CLICKS_SO_FAR_FEATURE_NAME] == 1 + 2
+    assert row3[SESSION_IMPRESSION_INDEX_FEATURE_NAME] == 2
+    assert row3[SESSION_CLICKS_SO_FAR_FEATURE_NAME] == 1 + 2
+
+
+def test_build_impression_rows_no_session_detail_omits_columns(tiny_catalog):
+    rows, _ = build_impression_rows(
+        impression_id=100,
+        candidate_ids=["1", "3"],
+        history=["2"],
+        impression_time=pd.Timestamp("2023-01-03"),
+        article_lookup=tiny_catalog["article_lookup"],
+        get_article_embedding=tiny_catalog["get_article_embedding"],
+        bm25_index=tiny_catalog["bm25"],
+        semantic_index=tiny_catalog["semantic"],
+        bm25_query="Weather forecast rain",
+        semantic_query_vector=np.array([0.0, 1.0]),
+        popularity_lookup=lambda aid, t: 0,
+        availability_gate=None,
+        gate_freshness=False,
+        clicked_by_article=None,
+        # session_detail omitted -- MIND-like caller
+    )
+    for row in rows:
+        assert SESSION_IMPRESSION_INDEX_FEATURE_NAME not in row
+        assert SESSION_CLICKS_SO_FAR_FEATURE_NAME not in row
 
 
 def test_build_impression_rows_gate_freshness_drops_unpublished_candidate(tiny_catalog):
@@ -522,6 +805,127 @@ def test_build_feature_table_impression_grouping_matches_candidate_counts(tiny_c
     assert list(group_sizes.values) == [2, 3]
 
 
+def test_build_feature_table_history_detail_missing_user_gets_zero_not_crash(tiny_catalog):
+    """The exact bug caught before it shipped: history_detail_by_user
+    provided for the TABLE, but one specific impression's user_id has no
+    entry in it. Every row must still get RECENCY_FEATURE_NAME/
+    DWELL_FEATURE_NAME (0.0, via the empty-history convention), not raise a
+    KeyError from a fixed column list some rows don't have."""
+    # user_id is a STRING here, matching news_reco.data.ebnerd_adapter's real
+    # common-schema convention (`.astype(str)`) -- not an int, which is
+    # exactly the type mismatch that let the real bug through undetected
+    # (see test_load_ebnerd_history_detail_reads_raw_parquet_arrays).
+    impressions = pd.DataFrame(
+        {
+            "impression_id": [1],
+            "user_id": ["999"],  # NOT a key in history_detail_by_user below
+            "time": pd.to_datetime(["2023-01-03"]),
+            "history": [["2"]],
+        }
+    )
+    table, _ = build_feature_table(
+        impressions,
+        {1: ["1", "3"]},
+        articles=tiny_catalog["articles"],
+        get_article_embedding=tiny_catalog["get_article_embedding"],
+        get_article_title=lambda aid: tiny_catalog["articles"].loc[aid, "title"],
+        bm25_index=tiny_catalog["bm25"],
+        semantic_index=tiny_catalog["semantic"],
+        popularity_lookup=lambda aid, t: 0,
+        history_detail_by_user={"1": [("2", pd.Timestamp("2023-01-01"), 10.0)]},  # keyed by user_id="1", not "999"
+    )
+    assert RECENCY_FEATURE_NAME in table.columns
+    assert DWELL_FEATURE_NAME in table.columns
+    assert (table[RECENCY_FEATURE_NAME] == 0.0).all()
+    assert (table[DWELL_FEATURE_NAME] == 0.0).all()
+
+
+def test_build_feature_table_history_detail_present_user_computes_correctly(tiny_catalog):
+    impressions = pd.DataFrame(
+        {
+            "impression_id": [1],
+            "user_id": ["1"],  # string, matching the real common-schema convention
+            "time": pd.to_datetime(["2023-01-03"]),
+            "history": [["2"]],
+        }
+    )
+    table, _ = build_feature_table(
+        impressions,
+        {1: ["1", "3"]},
+        articles=tiny_catalog["articles"],
+        get_article_embedding=tiny_catalog["get_article_embedding"],
+        get_article_title=lambda aid: tiny_catalog["articles"].loc[aid, "title"],
+        bm25_index=tiny_catalog["bm25"],
+        semantic_index=tiny_catalog["semantic"],
+        popularity_lookup=lambda aid, t: 0,
+        history_detail_by_user={"1": [("2", pd.Timestamp("2023-01-02"), 20.0)]},
+    )
+    # Same math as test_build_impression_rows_recency_and_dwell_hand_computed:
+    # one history article "2" ([0,1] embedding), read_time=20.0.
+    assert table.set_index("article_id")[DWELL_FEATURE_NAME].to_dict() == {"1": 20.0, "3": 20.0}
+
+
+def test_build_feature_table_session_detail_missing_user_gets_zero_not_crash(tiny_catalog):
+    """Same class of bug as history_detail's missing-user case: written with
+    STRING user_ids from the start this time, applying the lesson from
+    test_build_feature_table_history_detail_missing_user_gets_zero_not_crash
+    up front rather than after a real bug surfaced."""
+    impressions = pd.DataFrame(
+        {
+            "impression_id": [1],
+            "user_id": ["999"],  # NOT a key in session_detail_by_user below
+            "time": pd.to_datetime(["2023-01-03"]),
+            "history": [["2"]],
+        }
+    )
+    table, _ = build_feature_table(
+        impressions,
+        {1: ["1", "3"]},
+        articles=tiny_catalog["articles"],
+        get_article_embedding=tiny_catalog["get_article_embedding"],
+        get_article_title=lambda aid: tiny_catalog["articles"].loc[aid, "title"],
+        bm25_index=tiny_catalog["bm25"],
+        semantic_index=tiny_catalog["semantic"],
+        popularity_lookup=lambda aid, t: 0,
+        session_detail_by_user={"1": [(pd.Timestamp("2023-01-01"), 100, 5)]},  # keyed by "1", not "999"
+    )
+    assert SESSION_IMPRESSION_INDEX_FEATURE_NAME in table.columns
+    assert SESSION_CLICKS_SO_FAR_FEATURE_NAME in table.columns
+    assert (table[SESSION_IMPRESSION_INDEX_FEATURE_NAME] == 0).all()
+    assert (table[SESSION_CLICKS_SO_FAR_FEATURE_NAME] == 0).all()
+
+
+def test_build_feature_table_session_detail_present_user_computes_correctly(tiny_catalog):
+    impression_time = pd.Timestamp("2023-01-01 10:10")
+    impressions = pd.DataFrame(
+        {
+            "impression_id": [1],
+            "user_id": ["1"],
+            "time": [impression_time],
+            "history": [["2"]],
+        }
+    )
+    table, _ = build_feature_table(
+        impressions,
+        {1: ["1", "3"]},
+        articles=tiny_catalog["articles"],
+        get_article_embedding=tiny_catalog["get_article_embedding"],
+        get_article_title=lambda aid: tiny_catalog["articles"].loc[aid, "title"],
+        bm25_index=tiny_catalog["bm25"],
+        semantic_index=tiny_catalog["semantic"],
+        popularity_lookup=lambda aid, t: 0,
+        session_detail_by_user={
+            "1": [
+                (pd.Timestamp("2023-01-01 10:00"), 100, 1),
+                (pd.Timestamp("2023-01-01 10:05"), 100, 2),
+                (impression_time, 100, 3),
+            ]
+        },
+    )
+    assert (table[SESSION_IMPRESSION_INDEX_FEATURE_NAME] == 2).all()
+    assert (table[SESSION_CLICKS_SO_FAR_FEATURE_NAME] == 3).all()  # 1 + 2 from the two earlier impressions
+
+
 def test_build_feature_table_candidate_order_preserved_within_impression(tiny_catalog):
     impressions = pd.DataFrame(
         {"impression_id": [1], "time": pd.to_datetime(["2023-01-03"]), "history": [[]]}
@@ -636,9 +1040,15 @@ def _strip_project_root_line(content: bytes) -> bytes:
         # positive here even when the content is byte-identical. Content
         # comparison sidesteps that entirely and stays correct through any
         # future reorganization too.
-        ("scripts/generate_mind_submission.py", "scripts/submission/generate_mind_submission.py"),
-        ("scripts/generate_ebnerd_submission.py", "scripts/submission/generate_ebnerd_submission.py"),
-        ("scripts/evaluate_full.py", "scripts/evaluation/evaluate_full.py"),
+        # The scripts/ reorganization is now itself committed (HEAD already
+        # reflects the new paths), so head_path == current_path for these
+        # three -- the head_path/current_path split stays in the function
+        # signature/design (not collapsed back to a single path) because
+        # it's still the correct tool for the NEXT time a protected file
+        # moves, not because it's doing anything for these three right now.
+        ("scripts/submission/generate_mind_submission.py", "scripts/submission/generate_mind_submission.py"),
+        ("scripts/submission/generate_ebnerd_submission.py", "scripts/submission/generate_ebnerd_submission.py"),
+        ("scripts/evaluation/evaluate_full.py", "scripts/evaluation/evaluate_full.py"),
         ("src/news_reco/retrieval/lexical/bm25.py", "src/news_reco/retrieval/lexical/bm25.py"),
         ("src/news_reco/retrieval/semantic/embeddings.py", "src/news_reco/retrieval/semantic/embeddings.py"),
         ("src/news_reco/features/store.py", "src/news_reco/features/store.py"),
