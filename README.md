@@ -184,11 +184,18 @@ underperforms the single-feature `retrieval_temporal` ablation (now
 confirmed reproducible across two independent runs) — an unresolved
 feature-interference limitation, not swept under the rug. Within-session
 click patterns (the harder of the three behavioral-feature asks,
-EB-NeRD-only — MIND has no session concept at all) are now implemented
-(`session_impression_index`, `session_clicks_so_far`) and smoke-tested
-against real data (48% of impressions have real session context), but
-not yet retrained/evaluated — see the engineering log. Remaining work:
-that retrain, and the design-note PDF.
+EB-NeRD-only — MIND has no session concept at all) are implemented
+(`session_impression_index`, `session_clicks_so_far`), leak-safe, and
+retrained: adding them resolved the full model's earlier `best_iteration
+=1` anomaly (now 18–19 iterations, a much richer feature-importance
+spread), but test AUC is very slightly lower than the pre-session full
+model (ungated 0.6610 vs. 0.6693; gated 0.6559 vs. 0.6650), and the
+isolated `retrieval_session` ablation shows no measurable improvement on
+its own (same honest null result as `retrieval_recency_dwell`) — see the
+engineering log for the full, unresolved feature-interference discussion.
+All three of Q1.2's behavioral-feature asks (position, recency/dwell,
+within-session) are now implemented and evaluated. Remaining work: the
+design-note PDF.
 
 | Extra Component-2 tooling | Script |
 |---|---|

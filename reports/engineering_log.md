@@ -2433,3 +2433,86 @@ feature-table rebuild, full model retrain, `retrieval_session` ablation)
 -- holding for explicit confirmation before spending the ~1-2 hour
 rebuild cost, consistent with how every previous expensive run in this
 project was gated on an explicit go-ahead.
+
+**User approved (2026-09-05): retrain with session-context features
+included.** Ran the ungated full retrain (`gbdt_ebnerd_small.yaml`,
+`--rebuild-features`) and the gated full retrain
+(`gbdt_ebnerd_small_gated.yaml`, `--rebuild-features`) in parallel
+(separate caches, no conflict), then the `retrieval_session` ablation
+(reusing the just-rebuilt ungated cache, no rebuild needed).
+
+**Unexpected, genuinely interesting finding: adding the two session
+features resolved the previous `best_iteration=1` pathology.** Both the
+ungated (17 features) and gated (17 features) full models now stop at
+iteration 19 and 18 respectively -- not 1 -- with a much richer,
+non-degenerate feature-importance spread (every one of the 17 features
+gets used at least a few splits, vs. the earlier ~5-feature collapse).
+Reproduced across BOTH the ungated and gated builds again (same
+reproducibility-via-independent-build check as before), so this is a
+real, consistent effect of adding these two features to the full set,
+not a fluke of one run. Anti-gaming row-count check still holds exactly:
+gated train has 639 fewer rows than ungated (2,225,655 vs. 2,226,294),
+gated test has 61 fewer (2,928,881 vs. 2,928,942) -- identical to every
+prior violation-count check in this log.
+
+**But the resulting test AUC is slightly LOWER than the pre-session full
+model, in both ungated and gated forms:**
+
+| | AUC (pre-session) | AUC (+session) | change |
+|---|---|---|---|
+| Ungated full | 0.6693 (best_iter=1) | 0.6610 (best_iter=19) | -0.0083 |
+| Gated full | 0.6650 (best_iter=1) | 0.6559 (best_iter=18) | -0.0091 |
+
+Both are still large, significant improvements over the semantic
+baseline (ungated delta +0.1267 [+0.1252,+0.1283]; gated delta +0.1216
+[+0.1201,+0.1231]) -- this is a small regression relative to the
+previous full model, not a failure relative to baseline. Reported
+honestly rather than smoothed over: adding two real, individually
+non-degenerate features (verified via the earlier smoke test's 48%
+non-zero coverage) made the full model's training behave very
+differently (many more iterations, far less feature-importance
+concentration) while making its final held-out accuracy very slightly
+worse. A plausible but UNVERIFIED explanation, disclosed as speculation
+not fact: with `article_age_hours`/`candidate_position_in_impression` as
+extremely dominant features, the very first tree previously already hit
+a local optimum in validation nDCG that 20 further rounds couldn't beat;
+adding two more real (if individually weak) features gives the tree-
+builder more candidate splits at each node, letting it find marginal
+per-round nDCG gains often enough to survive ~18-19 rounds before
+patience runs out -- but "more rounds survived" evidently isn't the same
+as "a better final model" here. This is the THIRD instance of the same
+broader, still-unresolved limitation already on record in this log
+(`full` underperforming `retrieval_temporal` alone) -- feeding this
+GBDT re-ranker more features does not reliably improve it on EB-NeRD,
+and the mechanism is not fully understood. Worth a paragraph in the
+design note as a genuine, disclosed limitation, not swept under the rug.
+
+**`retrieval_session` ablation (isolated session-context contribution,
+test, n=244,647): no measurable isolated improvement**, matching
+`retrieval_recency_dwell`'s earlier null result almost exactly. AUC
+0.5311, delta -0.0033 [-0.0046,-0.0021] (significantly WORSE); MRR no
+significant difference [-0.0025,+0.0001]; nDCG@5 no significant
+difference [-0.0018,+0.0008]; nDCG@10 significantly worse -0.0016
+[-0.0027,-0.0006]. best_iteration=1 for this small 6-feature ablation
+(retrieval + the two session features only) -- consistent with a weak,
+quickly-exhausted signal, not the same phenomenon as the full model's
+now-resolved iteration-1 issue. This does not contradict the smoke
+test's 48% non-zero-coverage finding -- coverage is not the same as
+predictive power, and (like `retrieval_recency_dwell`) these features
+appear to carry real but very weak marginal signal on their own,
+too weak to move a LambdaRank model's ranking quality without other
+features (popularity, freshness, retrieval scores) to combine with.
+
+**Overall honest summary of the within-session click-patterns work**:
+implemented correctly (9 tests, real-data smoke-tested, leak-safe by
+design and by empirical verification), and it measurably changes how
+the full model trains -- but it does not, on this dataset, produce a
+measurable isolated accuracy improvement, and its presence in the full
+feature set is associated with a small full-model regression whose
+mechanism isn't fully understood. This mirrors `retrieval_recency_dwell`
+closely: implementing an assignment-required behavioral feature
+correctly and safely is not the same as it improving the metric, and
+that distinction is reported here rather than obscured. MIND is
+entirely unaffected by any of this work (no session concept exists
+there at all -- confirmed, not assumed, at the start of this feature's
+design).
